@@ -1,0 +1,549 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/*
+ * LILYGO T-Deck: ESP32-S3FN16R8 (16 MB flash, 8 MB octal PSRAM),
+ * 2.8" 320x240 ST7789 on SPI, GT911 touch, ES7210 dual-mic ADC,
+ * MAX98357A I2S speaker amp, BOOT on GPIO0, native USB Serial/JTAG.
+ *
+ * Pin source: Xinyuan-LilyGO/T-Deck (MIT), examples/*/utilities.h and
+ * Microphone.ino / I2SPlay.ino / Touchpad.ino, schematic/schematic.pdf.
+ * ST7789 orientation: the vendor runs TFT_eSPI setRotation(1) (landscape),
+ * which programs MADCTL = MX|MV; esp_lcd's swap_xy(true)+mirror(true,false)
+ * is the same setting (lib/TFT_eSPI/TFT_Drivers/ST7789_Rotation.h).
+ * Touch orientation: vendor Touchpad example, setSwapXY(true) and
+ * setMirrorXY(false, true) at 320x240.
+ *
+ * Display/touch/audio structure follows the in-repo AIPI (ST7789 +
+ * esp_lv_adapter, hand-driven), Waveshare LCD-7 (GT911) and EchoEar-2ST
+ * (ES7210) boards. Live audio and touch verification still required.
+ */
+#include "driver/gpio.h"
+#include "driver/i2c_master.h"
+#include "driver/i2s_std.h"
+#include "driver/ledc.h"
+#include "driver/usb_serial_jtag.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_check.h"
+#include "esp_codec_dev_defaults.h"
+#include "esp_lcd_panel_io.h"
+#include "esp_lcd_panel_ops.h"
+#include "esp_lcd_panel_vendor.h"
+#include "esp_lcd_touch_gt911.h"
+#include "esp_log.h"
+#include "esp_lv_adapter.h"
+#include "esp_sleep.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "muse_audio.h"
+#include "muse_board.h"
+
+static const char *TAG = "tdeck";
+
+/* Peripheral power: HIGH or the display, touch and audio stay dark. */
+#define POWERON_GPIO GPIO_NUM_10
+
+#define LCD_H_RES 320
+#define LCD_V_RES 240
+#define LCD_HOST SPI3_HOST
+#define LCD_SCLK GPIO_NUM_40
+#define LCD_MOSI GPIO_NUM_41
+#define LCD_CS   GPIO_NUM_12
+#define LCD_DC   GPIO_NUM_11
+#define LCD_BL   GPIO_NUM_42
+#define DRAW_BUF_LINES 32  /* 320*32*2 = 20 KB per DMA buffer */
+
+#define I2C_SDA GPIO_NUM_18
+#define I2C_SCL GPIO_NUM_8
+#define TOUCH_INT GPIO_NUM_16
+
+/* MAX98357A speaker amp: I2S0 TX. No MCLK, no control interface. */
+#define SPK_BCK  GPIO_NUM_7
+#define SPK_WS   GPIO_NUM_5
+#define SPK_DOUT GPIO_NUM_6
+
+/* ES7210 dual-mic ADC: I2S1 RX, controlled over I2C at 0x40. */
+#define MIC_MCLK GPIO_NUM_48
+#define MIC_WS   GPIO_NUM_21
+#define MIC_BCK  GPIO_NUM_47
+#define MIC_DIN  GPIO_NUM_14
+#define ES7210_ADDR 0x40
+
+/* SPI bus-mates of the display: SX1262 LoRa and the SD slot. Parked. */
+#define RADIO_CS GPIO_NUM_9
+#define SD_CS    GPIO_NUM_39
+
+#define TALK_GPIO GPIO_NUM_0  /* BOOT */
+#define BATT_ADC_CH ADC_CHANNEL_3  /* GPIO4, through the 100K/100K divider */
+
+static i2c_master_bus_handle_t s_i2c;
+static esp_lcd_panel_handle_t s_panel;
+static esp_lcd_touch_handle_t s_touch;
+static muse_gpio_button_t s_talk;
+static adc_oneshot_unit_handle_t s_adc;
+static adc_cali_handle_t s_cali;  /* NULL when eFuse calibration is missing */
+
+static esp_err_t init(void)
+{
+    /* Peripherals first: the vendor header says this pin must be HIGH
+     * when using the board's peripherals. */
+    ESP_RETURN_ON_ERROR(gpio_set_direction(POWERON_GPIO, GPIO_MODE_OUTPUT),
+                        TAG, "poweron dir");
+    ESP_RETURN_ON_ERROR(gpio_set_level(POWERON_GPIO, 1), TAG, "poweron");
+
+    /* The LoRa radio and the SD slot share the display's SPI bus
+     * (MOSI 41 / MISO 38 / SCK 40). Muse uses neither: keep their
+     * chip-selects high so they never answer the display's traffic. */
+    const gpio_config_t cs = {
+        .pin_bit_mask = (1ULL << LCD_CS) | (1ULL << RADIO_CS) |
+                        (1ULL << SD_CS),
+        .mode = GPIO_MODE_OUTPUT,
+    };
+    ESP_RETURN_ON_ERROR(gpio_config(&cs), TAG, "spi cs");
+    ESP_RETURN_ON_ERROR(gpio_set_level(LCD_CS, 1), TAG, "tft cs");
+    ESP_RETURN_ON_ERROR(gpio_set_level(RADIO_CS, 1), TAG, "radio cs");
+    ESP_RETURN_ON_ERROR(gpio_set_level(SD_CS, 1), TAG, "sd cs");
+
+    const i2c_master_bus_config_t i2c_cfg = {
+        .i2c_port = I2C_NUM_0,
+        .sda_io_num = I2C_SDA,
+        .scl_io_num = I2C_SCL,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
+    };
+    ESP_RETURN_ON_ERROR(i2c_new_master_bus(&i2c_cfg, &s_i2c), TAG, "i2c");
+    ESP_RETURN_ON_ERROR(muse_gpio_button_init(&s_talk, TALK_GPIO),
+                        TAG, "talk button");
+
+    const adc_oneshot_unit_init_cfg_t adc_cfg = { .unit_id = ADC_UNIT_1 };
+    ESP_RETURN_ON_ERROR(adc_oneshot_new_unit(&adc_cfg, &s_adc), TAG, "adc");
+    const adc_oneshot_chan_cfg_t ch_cfg = {
+        .atten = ADC_ATTEN_DB_12, .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+    ESP_RETURN_ON_ERROR(adc_oneshot_config_channel(s_adc, BATT_ADC_CH, &ch_cfg),
+                        TAG, "adc channel");
+    const adc_cali_curve_fitting_config_t cali_cfg = {
+        .unit_id = ADC_UNIT_1, .atten = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+    if (adc_cali_create_scheme_curve_fitting(&cali_cfg, &s_cali) != ESP_OK) {
+        ESP_LOGW(TAG, "ADC calibration unavailable; battery_mv will read 0");
+        s_cali = NULL;
+    }
+    return ESP_OK;
+}
+
+static lv_display_t *display_start(lv_indev_t **touch)
+{
+    const ledc_timer_config_t bl_timer = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .duty_resolution = LEDC_TIMER_10_BIT,
+        .timer_num = LEDC_TIMER_0,
+        .freq_hz = 20000,
+        .clk_cfg = LEDC_AUTO_CLK,
+    };
+    const ledc_channel_config_t bl_ch = {
+        .gpio_num = LCD_BL,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = LEDC_CHANNEL_0,
+        .timer_sel = LEDC_TIMER_0,
+        .duty = 0,
+    };
+    if (ledc_timer_config(&bl_timer) != ESP_OK ||
+        ledc_channel_config(&bl_ch) != ESP_OK) {
+        return NULL;
+    }
+
+    const spi_bus_config_t bus = {
+        .sclk_io_num = LCD_SCLK,
+        .mosi_io_num = LCD_MOSI,
+        .miso_io_num = GPIO_NUM_NC,
+        .quadwp_io_num = GPIO_NUM_NC,
+        .quadhd_io_num = GPIO_NUM_NC,
+        .max_transfer_sz = LCD_H_RES * DRAW_BUF_LINES * 2,
+    };
+    if (spi_bus_initialize(LCD_HOST, &bus, SPI_DMA_CH_AUTO) != ESP_OK) {
+        return NULL;
+    }
+    esp_lcd_panel_io_handle_t io;
+    const esp_lcd_panel_io_spi_config_t io_cfg = {
+        .cs_gpio_num = LCD_CS,
+        .dc_gpio_num = LCD_DC,
+        .spi_mode = 0,
+        .pclk_hz = 40 * 1000 * 1000,
+        .trans_queue_depth = 10,
+        .lcd_cmd_bits = 8,
+        .lcd_param_bits = 8,
+    };
+    if (esp_lcd_new_panel_io_spi(LCD_HOST, &io_cfg, &io) != ESP_OK) {
+        return NULL;
+    }
+    const esp_lcd_panel_dev_config_t panel_cfg = {
+        .reset_gpio_num = GPIO_NUM_NC,  /* not routed; software reset */
+        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_BGR,
+        .bits_per_pixel = 16,
+    };
+    if (esp_lcd_new_panel_st7789(io, &panel_cfg, &s_panel) != ESP_OK) {
+        return NULL;
+    }
+    esp_lcd_panel_reset(s_panel);
+    esp_lcd_panel_init(s_panel);
+    /* Landscape, matching the vendor's TFT_eSPI setRotation(1) = MX|MV. */
+    esp_lcd_panel_swap_xy(s_panel, true);
+    esp_lcd_panel_mirror(s_panel, true, false);
+    esp_lcd_panel_disp_on_off(s_panel, true);
+
+    /* GT911: vendor Touchpad example probes 0x5D (INT selects 0x14). */
+    uint8_t addr = 0x5D;
+    if (i2c_master_probe(s_i2c, addr, 50) != ESP_OK) {
+        addr = 0x14;
+        if (i2c_master_probe(s_i2c, addr, 50) != ESP_OK) {
+            ESP_LOGE(TAG, "GT911 not found");
+            return NULL;
+        }
+    }
+    ESP_LOGI(TAG, "GT911 at 0x%02x", addr);
+    esp_lcd_panel_io_handle_t tp_io;
+    esp_lcd_panel_io_i2c_config_t tp_io_cfg =
+        ESP_LCD_TOUCH_IO_I2C_GT911_CONFIG();
+    tp_io_cfg.dev_addr = addr;
+    tp_io_cfg.scl_speed_hz = 400000;
+    if (esp_lcd_new_panel_io_i2c(s_i2c, &tp_io_cfg, &tp_io) != ESP_OK) {
+        return NULL;
+    }
+    esp_lcd_touch_io_gt911_config_t gt_cfg = { .dev_addr = addr };
+    const esp_lcd_touch_config_t tp_cfg = {
+        .x_max = LCD_H_RES,
+        .y_max = LCD_V_RES,
+        .rst_gpio_num = GPIO_NUM_NC,
+        .int_gpio_num = TOUCH_INT,
+        .levels = { .reset = 0, .interrupt = 0 },
+        /* Vendor Touchpad example: swapXY(true), mirrorXY(false, true). */
+        .flags = { .swap_xy = 1, .mirror_x = 0, .mirror_y = 1 },
+        .driver_data = &gt_cfg,
+    };
+    if (esp_lcd_touch_new_i2c_gt911(tp_io, &tp_cfg, &s_touch) != ESP_OK) {
+        return NULL;
+    }
+
+    esp_lv_adapter_config_t adapter_cfg = ESP_LV_ADAPTER_DEFAULT_CONFIG();
+    adapter_cfg.task_core_id = MUSE_UI_CORE;
+    adapter_cfg.task_priority = MUSE_UI_PRIORITY;
+    if (esp_lv_adapter_init(&adapter_cfg) != ESP_OK) {
+        return NULL;
+    }
+    const esp_lv_adapter_display_config_t disp_cfg = {
+        .panel = s_panel,
+        .panel_io = io,
+        .profile = {
+            .interface = ESP_LV_ADAPTER_PANEL_IF_OTHER,
+            .rotation = ESP_LV_ADAPTER_ROTATE_0,
+            .hor_res = LCD_H_RES,
+            .ver_res = LCD_V_RES,
+            .buffer_height = DRAW_BUF_LINES,
+            .use_psram = false,
+            .require_double_buffer = true,
+        },
+        .tear_avoid_mode = ESP_LV_ADAPTER_TEAR_AVOID_MODE_NONE,
+    };
+    lv_display_t *disp = esp_lv_adapter_register_display(&disp_cfg);
+    if (!disp) {
+        return NULL;
+    }
+    const esp_lv_adapter_touch_config_t tp_lv_cfg =
+        ESP_LV_ADAPTER_TOUCH_DEFAULT_CONFIG(disp, s_touch);
+    *touch = esp_lv_adapter_register_touch(&tp_lv_cfg);
+    if (!*touch || esp_lv_adapter_start() != ESP_OK) {
+        return NULL;
+    }
+    return disp;
+}
+
+static bool display_lock(int timeout_ms)
+{
+    return esp_lv_adapter_lock(timeout_ms) == ESP_OK;
+}
+
+static void set_brightness(int pct)
+{
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, pct * 1023 / 100);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+}
+
+static void panel_sleep(bool sleep)
+{
+    esp_lcd_panel_disp_on_off(s_panel, !sleep);
+}
+
+static void display_pause(bool pause)
+{
+    if (pause) {
+        esp_lv_adapter_pause(-1);
+    } else {
+        esp_lv_adapter_resume();
+    }
+}
+
+/*
+ * MAX98357A: fixed-function I2S DAC+amp with no control interface.
+ * esp_codec_dev still needs an audio_codec_if_t, so implement the
+ * documented no-op codec (cf. the "dummy codec" section of the
+ * esp_codec_dev README). Every op succeeds; set_vol is a no-op because
+ * the gain is fixed in hardware, so Muse's volume slider has no effect
+ * on this board.
+ */
+static esp_err_t max98357a_open(const audio_codec_if_t *h,
+                                audio_codec_data_if_t *data_if, int rate,
+                                int bits, int ch)
+{
+    (void)h;
+    (void)data_if;
+    (void)rate;
+    (void)bits;
+    (void)ch;
+    return ESP_OK;
+}
+
+static esp_err_t max98357a_enable(const audio_codec_if_t *h, bool enable)
+{
+    (void)h;
+    (void)enable;
+    return ESP_OK;
+}
+
+static esp_err_t max98357a_set_fs(const audio_codec_if_t *h, int rate,
+                                  int bits, int ch)
+{
+    (void)h;
+    (void)rate;
+    (void)bits;
+    (void)ch;
+    return ESP_OK;
+}
+
+static esp_err_t max98357a_set_vol(const audio_codec_if_t *h, int vol)
+{
+    (void)h;
+    (void)vol;
+    return ESP_OK;  /* fixed hardware gain */
+}
+
+static esp_err_t max98357a_set_mic_gain(const audio_codec_if_t *h, int gain)
+{
+    (void)h;
+    (void)gain;
+    return ESP_OK;
+}
+
+static esp_err_t max98357a_close(const audio_codec_if_t *h)
+{
+    (void)h;
+    return ESP_OK;
+}
+
+static const audio_codec_if_t s_max98357a_codec = {
+    .open = max98357a_open,
+    .enable = max98357a_enable,
+    .set_fs = max98357a_set_fs,
+    .set_vol = max98357a_set_vol,
+    .set_mic_gain = max98357a_set_mic_gain,
+    .close = max98357a_close,
+};
+
+/* Two I2S peripherals: I2S0 TX feeds the MAX98357A speaker amp, I2S1 RX
+ * captures the ES7210 dual-mic ADC. Both run at MUSE_AUDIO_RATE (16 kHz),
+ * matching the vendor's own 16 kHz examples. */
+static esp_err_t audio_init(esp_codec_dev_handle_t *spk,
+                            esp_codec_dev_handle_t *mic)
+{
+    i2s_chan_handle_t tx;
+    i2s_chan_config_t tx_chan_cfg =
+        I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    tx_chan_cfg.auto_clear = true;
+    ESP_RETURN_ON_ERROR(i2s_new_channel(&tx_chan_cfg, &tx, NULL), TAG,
+                        "spk i2s channel");
+    const i2s_std_config_t tx_std = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(MUSE_AUDIO_RATE),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
+            I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+            .mclk = GPIO_NUM_NC,  /* MAX98357A needs no MCLK */
+            .bclk = SPK_BCK,
+            .ws = SPK_WS,
+            .dout = SPK_DOUT,
+            .din = GPIO_NUM_NC,
+        },
+    };
+    ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(tx, &tx_std), TAG,
+                        "spk i2s init");
+    ESP_RETURN_ON_ERROR(i2s_channel_enable(tx), TAG, "spk i2s enable");
+
+    audio_codec_i2s_cfg_t spk_data_cfg = {
+        .port = I2S_NUM_0, .rx_handle = NULL, .tx_handle = tx,
+    };
+    const audio_codec_data_if_t *spk_data =
+        audio_codec_new_i2s_data(&spk_data_cfg);
+    ESP_RETURN_ON_FALSE(spk_data, ESP_ERR_NO_MEM, TAG, "spk data if");
+    esp_codec_dev_cfg_t spk_cfg = {
+        .dev_type = ESP_CODEC_DEV_TYPE_OUT,
+        .codec_if = &s_max98357a_codec,
+        .data_if = spk_data,
+    };
+    *spk = esp_codec_dev_new(&spk_cfg);
+
+    ESP_RETURN_ON_ERROR(i2c_master_probe(s_i2c, ES7210_ADDR, 100), TAG,
+                        "ES7210 probe");
+    i2s_chan_handle_t rx;
+    i2s_chan_config_t rx_chan_cfg =
+        I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
+    ESP_RETURN_ON_ERROR(i2s_new_channel(&rx_chan_cfg, NULL, &rx), TAG,
+                        "mic i2s channel");
+    const i2s_std_config_t rx_std = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(MUSE_AUDIO_RATE),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
+            I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+            .mclk = MIC_MCLK,
+            .bclk = MIC_BCK,
+            .ws = MIC_WS,
+            .dout = GPIO_NUM_NC,
+            .din = MIC_DIN,
+        },
+    };
+    ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(rx, &rx_std), TAG,
+                        "mic i2s init");
+    ESP_RETURN_ON_ERROR(i2s_channel_enable(rx), TAG, "mic i2s enable");
+
+    audio_codec_i2s_cfg_t mic_data_cfg = {
+        .port = I2S_NUM_1, .rx_handle = rx, .tx_handle = NULL,
+    };
+    const audio_codec_data_if_t *mic_data =
+        audio_codec_new_i2s_data(&mic_data_cfg);
+    audio_codec_i2c_cfg_t mic_ctrl_cfg = {
+        .port = I2C_NUM_0, .addr = ES7210_ADDR, .bus_handle = s_i2c,
+    };
+    const audio_codec_ctrl_if_t *mic_ctrl =
+        audio_codec_new_i2c_ctrl(&mic_ctrl_cfg);
+    ESP_RETURN_ON_FALSE(mic_data && mic_ctrl, ESP_ERR_NO_MEM, TAG,
+                        "mic interfaces");
+    es7210_codec_cfg_t adc = {
+        .ctrl_if = mic_ctrl,
+        .mic_selected = ES7210_SEL_MIC1 | ES7210_SEL_MIC2,
+    };
+    const audio_codec_if_t *mic_codec = es7210_codec_new(&adc);
+    ESP_RETURN_ON_FALSE(mic_codec, ESP_FAIL, TAG, "ES7210 init");
+    esp_codec_dev_cfg_t mic_cfg = {
+        .dev_type = ESP_CODEC_DEV_TYPE_IN,
+        .codec_if = mic_codec,
+        .data_if = mic_data,
+    };
+    *mic = esp_codec_dev_new(&mic_cfg);
+    ESP_RETURN_ON_FALSE(*spk && *mic, ESP_FAIL, TAG, "codec handles");
+    ESP_LOGI(TAG, "MAX98357A speaker + ES7210 mic ready;"
+                  " live audio test still required");
+    return ESP_OK;
+}
+
+static unsigned poll_buttons(void)
+{
+    return muse_gpio_button_poll(&s_talk);
+}
+
+static void wait_buttons(int timeout_ms)
+{
+    muse_gpio_buttons_wait((muse_gpio_button_t *const[]){ &s_talk }, 1,
+                           timeout_ms);
+}
+
+/* Battery on GPIO4 through the 100K/100K divider (VBAT/2), per the
+ * schematic. Curve is a plain Li-ion map; verify against a meter. */
+static esp_err_t read_power(muse_power_t *out)
+{
+    out->battery_mv = 0;
+    out->battery_pct = -1;
+    out->charging = false;  /* no charge-status GPIO verified */
+    out->usb = usb_serial_jtag_is_connected();
+    if (!s_cali) {
+        return ESP_OK;
+    }
+    int sum = 0;
+    for (int i = 0; i < 8; i++) {
+        int raw;
+        ESP_RETURN_ON_ERROR(adc_oneshot_read(s_adc, BATT_ADC_CH, &raw), TAG,
+                            "adc read");
+        sum += raw;
+    }
+    int mv = 0;
+    ESP_RETURN_ON_ERROR(adc_cali_raw_to_voltage(s_cali, sum / 8, &mv), TAG,
+                        "adc cali");
+    out->battery_mv = mv * 2;
+    int pct = (out->battery_mv - 3300) * 100 / (4200 - 3300);
+    out->battery_pct = pct < 0 ? 0 : pct > 100 ? 100 : pct;
+    return ESP_OK;
+}
+
+static esp_err_t power_off(void)
+{
+    /* No software power latch on this board: kill the peripherals and
+     * deep-sleep until BOOT or RESET, like the BOX-3 board does. */
+    set_brightness(0);
+    esp_lcd_panel_disp_on_off(s_panel, false);
+    gpio_set_level(POWERON_GPIO, 0);
+    while (gpio_get_level(TALK_GPIO) == 0) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    ESP_RETURN_ON_ERROR(esp_sleep_enable_ext0_wakeup(TALK_GPIO, 0), TAG,
+                        "wake");
+    esp_deep_sleep_start();
+    return ESP_FAIL;
+}
+
+static const muse_board_t s_board = {
+    .name = "LILYGO T-Deck",
+    .width = LCD_H_RES,
+    .height = LCD_V_RES,
+    .round = false,
+    .touch = true,
+    .touch_talk = true,  /* on-screen mic; BOOT is the physical talk key */
+    .diagonal_in = 2.8f,
+    .talk_button = "boot",
+    .talk_hint = { LV_ALIGN_TOP_LEFT, 8, 8 },
+    .frame_ms = 40,
+    .init = init,
+    .display_start = display_start,
+    .display_lock = display_lock,
+    .display_unlock = esp_lv_adapter_unlock,
+    .set_brightness = set_brightness,
+    .panel_sleep = panel_sleep,
+    .display_pause = display_pause,
+    .audio_init = audio_init,
+    .mic_slot = -1,  /* mix both ES7210 mics */
+    .set_mic_gain = NULL,  /* esp_codec_dev drives the ES7210 gain */
+    .poll_buttons = poll_buttons,
+    .wait_buttons = wait_buttons,
+    .read_power = read_power,
+    .power_off = power_off,
+};
+
+/* Home Link's app_main starts Muse with this board (main/main.c). */
+const muse_board_t *muse_board_get(void)
+{
+    return &s_board;
+}

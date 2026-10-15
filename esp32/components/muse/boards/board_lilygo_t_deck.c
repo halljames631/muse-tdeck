@@ -35,6 +35,7 @@
 #include "driver/i2c_master.h"
 #include "driver/i2s_std.h"
 #include "driver/ledc.h"
+#include "driver/spi_master.h"
 #include "driver/usb_serial_jtag.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
@@ -53,6 +54,7 @@
 
 #include "muse_audio.h"
 #include "muse_board.h"
+#include "muse_mem.h"
 
 static const char *TAG = "tdeck";
 
@@ -131,6 +133,8 @@ static esp_err_t init(void)
     ESP_RETURN_ON_ERROR(i2c_new_master_bus(&i2c_cfg, &s_i2c), TAG, "i2c");
     ESP_RETURN_ON_ERROR(muse_gpio_button_init(&s_talk, TALK_GPIO),
                         TAG, "talk button");
+    /* BOOT is held at flashing time; don't count that as a press. */
+    s_talk.pressed = gpio_get_level(TALK_GPIO) == 0;
 
     const adc_oneshot_unit_init_cfg_t adc_cfg = { .unit_id = ADC_UNIT_1 };
     ESP_RETURN_ON_ERROR(adc_oneshot_new_unit(&adc_cfg, &s_adc), TAG, "adc");
@@ -140,7 +144,7 @@ static esp_err_t init(void)
     ESP_RETURN_ON_ERROR(adc_oneshot_config_channel(s_adc, BATT_ADC_CH, &ch_cfg),
                         TAG, "adc channel");
     const adc_cali_curve_fitting_config_t cali_cfg = {
-        .unit_id = ADC_UNIT_1, .atten = ADC_ATTEN_DB_12,
+        .unit_id = ADC_UNIT_1, .chan = BATT_ADC_CH, .atten = ADC_ATTEN_DB_12,
         .bitwidth = ADC_BITWIDTH_DEFAULT,
     };
     if (adc_cali_create_scheme_curve_fitting(&cali_cfg, &s_cali) != ESP_OK) {

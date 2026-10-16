@@ -469,12 +469,20 @@ static void ondevice_setup(void)
     lv_label_set_text(title, "DEVICE SETUP");
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 6);
 
+    /* If the token is baked into the firmware, don't ask for it. */
+    const bool token_done =
+#ifdef CONFIG_GADGET_SDK_TOKEN
+        CONFIG_GADGET_SDK_TOKEN[0] != '\0';
+#else
+        false;
+#endif
+    const int nfields = token_done ? 2 : 3;
     static const char *const labels[3] = {
         "WiFi name", "WiFi password", "Token (mgst_...)" };
     static const uint32_t maxlen[3] = {
         MUSE_SSID_MAX, MUSE_PASS_MAX, MUSE_TOKEN_MAX };
     lv_obj_t *tas[3];
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < nfields; i++) {
         lv_obj_t *lb = lv_label_create(scr);
         lv_label_set_text(lb, labels[i]);
         lv_obj_set_pos(lb, 12, 30 + i * 50);
@@ -506,7 +514,7 @@ static void ondevice_setup(void)
 
     int focus = 0;
     bool done = false;
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < nfields; i++) {
         lv_obj_set_style_border_width(tas[i], i == focus ? 2 : 0,
                                       LV_PART_MAIN);
     }
@@ -520,10 +528,10 @@ static void ondevice_setup(void)
         } else if (k == 0x08 || k == 0x7F) {
             lv_textarea_delete_char(tas[focus]);
         } else if (k == '\r' || k == '\n') {
-            if (++focus >= 3) {
+            if (++focus >= nfields) {
                 save = true;
             } else {
-                for (int i = 0; i < 3; i++) {
+                for (int i = 0; i < nfields; i++) {
                     lv_obj_set_style_border_width(tas[i], i == focus ? 2 : 0,
                                                   LV_PART_MAIN);
                 }
@@ -544,13 +552,13 @@ static void ondevice_setup(void)
     if (save) {
         const char *s = lv_textarea_get_text(tas[0]);
         const char *pw = lv_textarea_get_text(tas[1]);
-        const char *t = lv_textarea_get_text(tas[2]);
+        const char *t = nfields > 2 ? lv_textarea_get_text(tas[2]) : "";
         if (s[0] != '\0') {
             muse_settings_set_wifi(s, pw);
             ESP_LOGI(TAG, "wifi saved for '%s'", s);
             changed = true;
         }
-        if (t[0] != '\0' &&
+        if (!token_done && t[0] != '\0' &&
             muse_settings_set_hatch_token(t, false) == ESP_OK) {
             ESP_LOGI(TAG, "token saved");
             changed = true;

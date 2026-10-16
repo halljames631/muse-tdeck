@@ -643,10 +643,25 @@ static void chat_add_message(lv_obj_t *hist, const char *who, const char *text)
 
 static void chat_task(void *arg)
 {
-    /* Let the SDK finish building its UI before we take the screen. */
-    vTaskDelay(pdMS_TO_TICKS(5000));
-
+    /* Let the SDK finish connecting. Show a hint; take the screen only when
+     * the user presses Enter, so we never fight the SDK mid-connection. */
+    vTaskDelay(pdMS_TO_TICKS(8000));
     display_lock(-1);
+    lv_obj_t *hint = lv_label_create(lv_screen_active());
+    lv_label_set_text(hint, "ENTER for chat");
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -4);
+    esp_lv_adapter_unlock();
+
+    /* Wait for Enter. */
+    while (1) {
+        char k = keyboard_poll();
+        if (k == '\r' || k == '\n') {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    display_lock(-1);
+    lv_obj_delete(hint);
     lv_obj_t *scr = lv_obj_create(NULL);
     lv_screen_load(scr);
     lv_obj_t *hist = lv_obj_create(scr);

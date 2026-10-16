@@ -194,6 +194,7 @@ static esp_err_t init(void)
 }
 
 static void ondevice_setup(void);
+static void chat_task(void *arg);
 
 static lv_display_t *display_start(lv_indev_t **touch)
 {

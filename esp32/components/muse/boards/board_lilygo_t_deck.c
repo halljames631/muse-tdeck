@@ -110,7 +110,7 @@ static i2c_master_dev_handle_t s_kb;
 static void keyboard_init(void)
 {
     const i2c_device_config_t kb_cfg = {
-        .dev_address_length = I2C_ADDR_BIT_LEN_7,
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = KB_ADDR,
         .scl_speed_hz = 400000,
     };

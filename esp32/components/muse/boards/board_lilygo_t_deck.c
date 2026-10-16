@@ -617,15 +617,8 @@ static void ondevice_setup(void)
     }
 #endif
     if (ssid) {
-        ESP_LOGI(TAG, "starting WiFi connect to '%s' in background", ssid);
-        size_t sl = strlen(ssid) + 1;
-        size_t pl = (pass ? strlen(pass) : 0) + 1;
-        char *buf = malloc(sl + pl);
-        if (buf) {
-            memcpy(buf, ssid, sl);
-            memcpy(buf + sl, pass ? pass : "", pl);
-            xTaskCreate(wifi_connect_task, "tdeck_wifi", 4096, buf, 5, NULL);
-        }
+        ESP_LOGI(TAG, "WiFi creds found for '%s' (direct connect disabled for safety)", ssid);
+        /* TODO: re-enable after confirming SDK netif init order */
     } else {
         ESP_LOGW(TAG, "no WiFi credentials configured");
     }
@@ -651,9 +644,9 @@ static void chat_add_message(lv_obj_t *hist, const char *who, const char *text)
 static void chat_task(void *arg)
 {
     (void)arg;
-    /* Revamped chat: full-screen UI, keyboard input, replies via console
-     * interceptor (@chat JSON). Shows immediately; WiFi connects in parallel. */
-    chat_intercept_init();
+    /* Revamped chat: full-screen UI, keyboard input.
+     * NOTE: console interceptor disabled (caused black screen). */
+    /* chat_intercept_init(); */
 
     display_lock(-1);
     lv_obj_t *scr = lv_obj_create(NULL);

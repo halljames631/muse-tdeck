@@ -102,6 +102,42 @@ static muse_gpio_button_t s_talk;
 static adc_oneshot_unit_handle_t s_adc;
 static adc_cali_handle_t s_cali;  /* NULL when eFuse calibration is missing */
 
+#define KB_ADDR 0x55
+#define KB_INT  GPIO_NUM_46
+
+static i2c_master_dev_handle_t s_kb;
+
+static void keyboard_init(void)
+{
+    const i2c_device_config_t kb_cfg = {
+        .dev_address_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = KB_ADDR,
+        .scl_speed_hz = 400000,
+    };
+    if (i2c_master_bus_add_device(s_i2c, &kb_cfg, &s_kb) != ESP_OK) {
+        s_kb = NULL;
+    }
+}
+
+static char keyboard_poll(void)
+{
+    uint8_t b = 0;
+    if (!s_kb || i2c_master_receive(s_kb, &b, 1, 20) != ESP_OK || b == 0) {
+        return 0;
+    }
+    return (char)b;
+}
+
+static void keyboard_set_brightness(uint8_t level)
+{
+    if (!s_kb) {
+        return;
+    }
+    const uint8_t cmd[2] = { 0x01, level };
+    i2c_master_transmit(s_kb, cmd, sizeof(cmd), 50);
+}
+
+
 static esp_err_t init(void)
 {
     /* Peripherals first: the vendor header says this pin must be HIGH
@@ -132,6 +168,7 @@ static esp_err_t init(void)
         .flags.enable_internal_pullup = true,
     };
     ESP_RETURN_ON_ERROR(i2c_new_master_bus(&i2c_cfg, &s_i2c), TAG, "i2c");
+    keyboard_init();
     ESP_RETURN_ON_ERROR(muse_gpio_button_init(&s_talk, TALK_GPIO),
                         TAG, "talk button");
     /* BOOT is held at flashing time; don't count that as a press. */
@@ -154,6 +191,8 @@ static esp_err_t init(void)
     }
     return ESP_OK;
 }
+
+static void ondevice_setup(void);
 
 static lv_display_t *display_start(lv_indev_t **touch)
 {
@@ -400,24 +439,6 @@ static const muse_board_t s_board = {
  * It appears when no WiFi is saved yet, or when BOOT is held at boot.
  * Enter advances fields (saves on the last one), Backspace deletes,
  * ESC skips. The SAVE button is also tappable. */
-
-#define KB_ADDR 0x55
-#define KB_INT  GPIO_NUM_46
-
-static char keyboard_poll(void)
-{
-    uint8_t b = 0;
-    if (i2c_master_receive(s_i2c, KB_ADDR, &b, 1, 20) != ESP_OK || b == 0) {
-        return 0;
-    }
-    return (char)b;
-}
-
-static void keyboard_set_brightness(uint8_t level)
-{
-    const uint8_t cmd[2] = { 0x01, level };
-    i2c_master_transmit(s_i2c, KB_ADDR, cmd, sizeof(cmd), 50);
-}
 
 static void setup_save_cb(lv_event_t *e)
 {

@@ -320,7 +320,8 @@ static lv_display_t *display_start(lv_indev_t **touch)
         return NULL;
     }
     ondevice_setup();
-    xTaskCreate(chat_task, "tdeck_chat", 8192, NULL, 5, NULL);
+    /* Chat task disabled for reboot isolation test. */
+    // xTaskCreate(chat_task, "tdeck_chat", 8192, NULL, 5, NULL);
     return disp;
 }
 

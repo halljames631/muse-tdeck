@@ -51,12 +51,21 @@
 #include "esp_sleep.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+#include <string.h>
+#include <stdio.h>
 
 #include "muse_board.h"
 #include "muse_mem.h"
 #include "muse_settings.h"
 #include "muse_chat.h"
 #include "esp_system.h"  /* esp_restart */
+#include "esp_wifi.h"
+#include "esp_netif.h"
+#include "esp_event.h"
+#include "nvs_flash.h"
+#include "lwip/inet.h"
 
 static const char *TAG = "tdeck";
 
@@ -193,6 +202,140 @@ static esp_err_t init(void)
     return ESP_OK;
 }
 
+/* ---- Direct WiFi manager (bypasses SDK Link layer) ---- */
+static void wifi_connect_task(void *arg)
+{
+    char *ssid = (char *)arg;
+    /* Password follows ssid in the buffer: ssid\0pass */
+    char *pass = ssid + strlen(ssid) + 1;
+    tdeck_wifi_connect(ssid, pass);
+    free(ssid);
+    vTaskDelete(NULL);
+}
+
+static bool s_wifi_connected = false;
+static char s_wifi_ip[16] = {0};
+static SemaphoreHandle_t s_wifi_done = NULL;
+
+static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        s_wifi_connected = false;
+        ESP_LOGI(TAG, "wifi disconnected, retrying");
+        esp_wifi_connect();
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
+        snprintf(s_wifi_ip, sizeof(s_wifi_ip), IPSTR, IP2STR(&e->ip_info.ip));
+        s_wifi_connected = true;
+        ESP_LOGI(TAG, "wifi connected, ip=%s", s_wifi_ip);
+        if (s_wifi_done) xSemaphoreGive(s_wifi_done);
+    }
+}
+
+static bool tdeck_wifi_connect(const char *ssid, const char *pass)
+{
+    if (!ssid || !ssid[0]) return false;
+    ESP_LOGI(TAG, "connecting to '%s'", ssid);
+
+    esp_netif_init();
+    esp_event_loop_create_default();
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL);
+    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL);
+
+    wifi_config_t wc = {0};
+    strlcpy((char *)wc.sta.ssid, ssid, sizeof(wc.sta.ssid));
+    if (pass) strlcpy((char *)wc.sta.password, pass, sizeof(wc.sta.password));
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_set_config(WIFI_IF_STA, &wc);
+    esp_wifi_start();
+
+    s_wifi_done = xSemaphoreCreateBinary();
+    /* Wait up to 20s for connection */
+    bool ok = xSemaphoreTake(s_wifi_done, pdMS_TO_TICKS(20000)) == pdTRUE;
+    vSemaphoreDelete(s_wifi_done);
+    s_wifi_done = NULL;
+    return ok && s_wifi_connected;
+}
+
+/* ---- Console interceptor: captures @chat JSON replies ---- */
+#define CHAT_Q_LEN 8
+typedef struct {
+    char type[16];
+    char text[512];
+} chat_msg_t;
+static QueueHandle_t s_chat_q = NULL;
+static FILE *s_orig_stdout = NULL;
+
+static int chat_intercept_write(void *ctx, const char *buf, int n)
+{
+    (void)ctx;
+    /* Scan for @chat lines */
+    const char *p = buf;
+    const char *end = buf + n;
+    while (p < end) {
+        const char *line_end = memchr(p, '\n', end - p);
+        if (!line_end) line_end = end;
+        if ((line_end - p) > 6 && memcmp(p, "@chat ", 6) == 0) {
+            /* Parse {"seq":N,"type":"TYPE",...,"text":"TEXT"} */
+            chat_msg_t m = {0};
+            const char *t = strstr(p, "\"type\":\"");
+            if (t) {
+                t += 8;
+                const char *q = strchr(t, '"');
+                if (q && (q - t) < (int)sizeof(m.type)) {
+                    memcpy(m.type, t, q - t);
+                }
+            }
+            const char *x = strstr(p, "\"text\":\"");
+            if (x) {
+                x += 8;
+                /* Unescape simple sequences, copy until closing quote */
+                char *o = m.text;
+                size_t cap = sizeof(m.text) - 1;
+                while (*x && *x != '"' && cap > 0) {
+                    if (*x == '\\' && x[1]) {
+                        x++;
+                        *o++ = (*x == 'n') ? '\n' : (*x == 't') ? '\t' : *x;
+                        x++; cap--;
+                    } else {
+                        *o++ = *x++; cap--;
+                    }
+                }
+                *o = '\0';
+            }
+            if (m.type[0] && s_chat_q) {
+                xQueueSend(s_chat_q, &m, 0);
+            }
+        }
+        p = line_end + 1;
+    }
+    /* Forward to original stdout so USB serial still works */
+    if (s_orig_stdout) {
+        return fwrite(buf, 1, n, s_orig_stdout);
+    }
+    return n;
+}
+
+static void chat_intercept_init(void)
+{
+    s_chat_q = xQueueCreate(CHAT_Q_LEN, sizeof(chat_msg_t));
+    s_orig_stdout = stdout;
+    /* Replace stdout with our interceptor */
+    stdout = funopen(NULL, NULL, chat_intercept_write, NULL, NULL);
+    if (!stdout) {
+        stdout = s_orig_stdout;
+        ESP_LOGW(TAG, "funopen failed; chat replies won't be captured");
+    } else {
+        ESP_LOGI(TAG, "console interceptor installed");
+    }
+}
+
 static void ondevice_setup(void);
 static void chat_task(void *arg);
 
@@ -320,8 +463,8 @@ static lv_display_t *display_start(lv_indev_t **touch)
         return NULL;
     }
     ondevice_setup();
-    /* Chat task disabled for reboot isolation test. */
-    // xTaskCreate(chat_task, "tdeck_chat", 8192, NULL, 5, NULL);
+    /* Start the chat UI (revamped: handles WiFi status + messaging). */
+    xTaskCreate(chat_task, "tdeck_chat", 12288, NULL, 5, NULL);
     return disp;
 }
 
@@ -451,142 +594,41 @@ static void setup_save_cb(lv_event_t *e)
 
 static void ondevice_setup(void)
 {
-    /* NOTE: SDK's HOMEHUB_WIFI_SSID override does not work on T-Deck
-     * (stuck in BLE setup mode). Always use the on-device setup screen. */
+    /* Revamped: connect WiFi directly via ESP-IDF. Credentials from
+     * CONFIG_HOMEHUB_WIFI_SSID/PASSWORD (SDK standard), or TDECK_ fallback.
+     * The chat task shows the UI; this just ensures network is up. */
+    const char *ssid = NULL;
+    const char *pass = NULL;
+#ifdef CONFIG_HOMEHUB_WIFI_SSID
+    if (CONFIG_HOMEHUB_WIFI_SSID[0] != '\0') {
+        ssid = CONFIG_HOMEHUB_WIFI_SSID;
+#ifdef CONFIG_HOMEHUB_WIFI_PASSWORD
+        pass = CONFIG_HOMEHUB_WIFI_PASSWORD;
+#endif
+    }
+#endif
 #ifdef CONFIG_TDECK_WIFI_SSID
-    if (CONFIG_TDECK_WIFI_SSID[0] != '\0') {
-        muse_settings_set_wifi(CONFIG_TDECK_WIFI_SSID, CONFIG_TDECK_WIFI_PASS);
-        ESP_LOGI(TAG, "using TDECK hard-coded WiFi '%s'", CONFIG_TDECK_WIFI_SSID);
-        return;
+    if (!ssid && CONFIG_TDECK_WIFI_SSID[0] != '\0') {
+        ssid = CONFIG_TDECK_WIFI_SSID;
+#ifdef CONFIG_TDECK_WIFI_PASS
+        pass = CONFIG_TDECK_WIFI_PASS;
+#endif
     }
 #endif
-    char ssid[MUSE_SSID_MAX + 1] = {0};
-    char pass[MUSE_PASS_MAX + 1] = {0};
-    muse_settings_wifi(ssid, pass);
-    if (ssid[0] != '\0' && gpio_get_level(TALK_GPIO) != 0) {
-        ESP_LOGI(TAG, "saved WiFi '%s' found; skipping setup", ssid);
-        return;
-    }
-
-    ESP_LOGI(TAG, "on-device setup: type credentials on the keyboard");
-    set_brightness(100);  /* SDK only lights the backlight after display_start */
-    keyboard_set_brightness(120);
-
-    lv_obj_t *scr = lv_screen_active();  /* SDK builds on this too; clean up after */
-    if (!scr) {
-        ESP_LOGW(TAG, "no screen yet; skipping on-device setup");
-        return;
-    }
-
-    display_lock(-1);  /* LVGL is not thread-safe; the render task is running */
-    lv_obj_t *title = lv_label_create(scr);
-    lv_label_set_text(title, "DEVICE SETUP");
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 6);
-
-    /* If the token is baked into the firmware, don't ask for it. */
-    const bool token_done =
-#ifdef CONFIG_GADGET_SDK_TOKEN
-        CONFIG_GADGET_SDK_TOKEN[0] != '\0';
-#else
-        false;
-#endif
-    const int nfields = token_done ? 2 : 3;
-    static const char *const labels[3] = {
-        "WiFi name", "WiFi password", "Token (mgst_...)" };
-    static const uint32_t maxlen[3] = {
-        MUSE_SSID_MAX, MUSE_PASS_MAX, MUSE_TOKEN_MAX };
-    lv_obj_t *tas[3];
-    for (int i = 0; i < nfields; i++) {
-        lv_obj_t *lb = lv_label_create(scr);
-        lv_label_set_text(lb, labels[i]);
-        lv_obj_set_pos(lb, 12, 30 + i * 50);
-        tas[i] = lv_textarea_create(scr);
-        lv_textarea_set_one_line(tas[i], true);
-        lv_textarea_set_max_length(tas[i], maxlen[i]);
-        if (i == 1) {
-            lv_textarea_set_password_mode(tas[i], true);
+    if (ssid) {
+        ESP_LOGI(TAG, "starting WiFi connect to '%s' in background", ssid);
+        size_t sl = strlen(ssid) + 1;
+        size_t pl = (pass ? strlen(pass) : 0) + 1;
+        char *buf = malloc(sl + pl);
+        if (buf) {
+            memcpy(buf, ssid, sl);
+            memcpy(buf + sl, pass ? pass : "", pl);
+            xTaskCreate(wifi_connect_task, "tdeck_wifi", 4096, buf, 5, NULL);
         }
-        if (i == 0 && ssid[0] != '\0') {
-            lv_textarea_set_text(tas[i], ssid);
-        }
-        lv_obj_set_size(tas[i], 296, 30);
-        lv_obj_set_pos(tas[i], 12, 46 + i * 50);
+    } else {
+        ESP_LOGW(TAG, "no WiFi credentials configured");
     }
-
-    lv_obj_t *hint = lv_label_create(scr);
-    lv_label_set_text(hint, "Enter: next   Bksp: del   ESC: skip");
-    lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, 182);
-
-    bool save = false;
-    lv_obj_t *btn = lv_button_create(scr);
-    lv_obj_set_size(btn, 200, 34);
-    lv_obj_align(btn, LV_ALIGN_TOP_MID, 0, 198);
-    lv_obj_t *bl = lv_label_create(btn);
-    lv_label_set_text(bl, "SAVE & REBOOT");
-    lv_obj_center(bl);
-    lv_obj_add_event_cb(btn, setup_save_cb, LV_EVENT_CLICKED, &save);
-
-    int focus = 0;
-    bool done = false;
-    for (int i = 0; i < nfields; i++) {
-        lv_obj_set_style_border_width(tas[i], i == focus ? 2 : 0,
-                                      LV_PART_MAIN);
-    }
-    esp_lv_adapter_unlock();
-    while (!done) {
-        char k = keyboard_poll();
-        if (k) {
-            display_lock(-1);
-        if (k >= 0x20 && k <= 0x7E) {
-            lv_textarea_add_char(tas[focus], (uint32_t)(unsigned char)k);
-        } else if (k == 0x08 || k == 0x7F) {
-            lv_textarea_delete_char(tas[focus]);
-        } else if (k == '\r' || k == '\n') {
-            if (++focus >= nfields) {
-                save = true;
-            } else {
-                for (int i = 0; i < nfields; i++) {
-                    lv_obj_set_style_border_width(tas[i], i == focus ? 2 : 0,
-                                                  LV_PART_MAIN);
-                }
-            }
-        } else if (k == 0x1B) {
-            done = true;  /* ESC: skip */
-        }
-            esp_lv_adapter_unlock();
-        }
-        if (save) {
-            done = true;
-        }
-        vTaskDelay(pdMS_TO_TICKS(30));
-    }
-    display_lock(-1);
-
-    bool changed = false;
-    if (save) {
-        const char *s = lv_textarea_get_text(tas[0]);
-        const char *pw = lv_textarea_get_text(tas[1]);
-        const char *t = nfields > 2 ? lv_textarea_get_text(tas[2]) : "";
-        if (s[0] != '\0') {
-            muse_settings_set_wifi(s, pw);
-            ESP_LOGI(TAG, "wifi saved for '%s'", s);
-            changed = true;
-        }
-        if (!token_done && t[0] != '\0' &&
-            muse_settings_set_hatch_token(t, false) == ESP_OK) {
-            ESP_LOGI(TAG, "token saved");
-            changed = true;
-        }
-    }
-    lv_obj_clean(scr);  /* remove our widgets; leave the screen for the SDK */
-    esp_lv_adapter_unlock();
-    if (changed) {
-        vTaskDelay(pdMS_TO_TICKS(300));
-        esp_restart();
-    }
-    /* Skipped or nothing entered: the SDK shows its own setup screen. */
 }
-
 
 /* ---- On-device chat ----
  *
@@ -607,50 +649,57 @@ static void chat_add_message(lv_obj_t *hist, const char *who, const char *text)
 
 static void chat_task(void *arg)
 {
-    /* Let the SDK finish connecting. Show a hint; take the screen only when
-     * the user presses Enter, so we never fight the SDK mid-connection. */
-    vTaskDelay(pdMS_TO_TICKS(8000));
-    display_lock(-1);
-    lv_obj_t *hint = lv_label_create(lv_screen_active());
-    lv_label_set_text(hint, "ENTER for chat");
-    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -4);
-    esp_lv_adapter_unlock();
+    (void)arg;
+    /* Revamped chat: full-screen UI, keyboard input, replies via console
+     * interceptor (@chat JSON). Shows immediately; WiFi connects in parallel. */
+    chat_intercept_init();
 
-    /* Wait for Enter. */
-    while (1) {
-        char k = keyboard_poll();
-        if (k == '\r' || k == '\n') {
-            break;
-        }
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
     display_lock(-1);
-    lv_obj_delete(hint);
     lv_obj_t *scr = lv_obj_create(NULL);
     lv_screen_load(scr);
+
+    /* Status bar */
+    lv_obj_t *status = lv_label_create(scr);
+    lv_obj_set_pos(status, 5, 2);
+    lv_obj_set_width(status, 310);
+    lv_label_set_text(status, s_wifi_connected ? "WiFi OK" : "Connecting WiFi...");
+
+    /* Message history */
     lv_obj_t *hist = lv_obj_create(scr);
-    lv_obj_set_size(hist, 320, 188);
-    lv_obj_set_pos(hist, 0, 0);
+    lv_obj_set_size(hist, 320, 170);
+    lv_obj_set_pos(hist, 0, 20);
     lv_obj_set_flex_flow(hist, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scroll_dir(hist, LV_DIR_VER);
+
+    /* Input field */
     lv_obj_t *input = lv_textarea_create(scr);
     lv_textarea_set_one_line(input, true);
     lv_textarea_set_max_length(input, 512);
+    lv_textarea_set_placeholder_text(input, "Type message, Enter sends");
     lv_obj_set_size(input, 310, 36);
     lv_obj_set_pos(input, 5, 196);
     esp_lv_adapter_unlock();
 
     display_lock(-1);
-    chat_add_message(hist, "Sys", "Type a message below, Enter sends.");
+    chat_add_message(hist, "Sys", "T-Deck Muse Chat. Type below, Enter sends.");
+    if (!s_wifi_connected) {
+        chat_add_message(hist, "Sys", "Waiting for WiFi...");
+    }
     esp_lv_adapter_unlock();
 
-    char ibuf[513];
+    char ibuf[513] = {0};
     size_t ilen = 0;
-    char reply[8192];
-    size_t rlen = 0;
     bool waiting = false;
     lv_obj_t *reply_lb = NULL;
+    char reply_accum[4096] = {0};
 
     while (1) {
+        /* Update WiFi status */
+        display_lock(-1);
+        lv_label_set_text(status, s_wifi_connected ? "WiFi OK" : "Connecting WiFi...");
+        esp_lv_adapter_unlock();
+
+        /* Keyboard input */
         char k = keyboard_poll();
         if (k && !waiting) {
             display_lock(-1);
@@ -662,53 +711,65 @@ static void chat_task(void *arg)
                 ibuf[--ilen] = '\0';
                 lv_textarea_set_text(input, ibuf);
             } else if ((k == '\r' || k == '\n') && ilen > 0) {
-                chat_add_message(hist, "You", ibuf);
-                char *msg = strdup(ibuf);
-                ibuf[0] = '\0';
-                ilen = 0;
-                lv_textarea_set_text(input, "");
-                /* Unlock around the send; it can block. */
-                esp_lv_adapter_unlock();
-                muse_hatch_text_turn(msg);  /* frees msg */
-                display_lock(-1);
-                waiting = true;
-                rlen = 0;
-                reply[0] = '\0';
-                reply_lb = lv_label_create(hist);
-                lv_label_set_text(reply_lb, "Muse: ...");
-                lv_label_set_long_mode(reply_lb, LV_LABEL_LONG_WRAP);
-                lv_obj_set_width(reply_lb, 296);
+                if (!s_wifi_connected) {
+                    chat_add_message(hist, "Sys", "No WiFi yet, can't send.");
+                } else {
+                    chat_add_message(hist, "You", ibuf);
+                    char *msg = strdup(ibuf);
+                    ibuf[0] = '\0'; ilen = 0;
+                    lv_textarea_set_text(input, "");
+                    esp_lv_adapter_unlock();
+                    muse_hatch_text_turn(msg);  /* frees msg */
+                    display_lock(-1);
+                    waiting = true;
+                    reply_accum[0] = '\0';
+                    reply_lb = lv_label_create(hist);
+                    lv_label_set_text(reply_lb, "Muse: thinking...");
+                    lv_label_set_long_mode(reply_lb, LV_LABEL_LONG_WRAP);
+                    lv_obj_set_width(reply_lb, 296);
+                    lv_obj_scroll_to_view(reply_lb, LV_ANIM_OFF);
+                }
             }
             esp_lv_adapter_unlock();
         }
-        if (waiting) {
-            char evtext[1024];
-            muse_hatch_ev_t ev = muse_hatch_turn_event(evtext, sizeof(evtext));
-            if (ev == MUSE_HATCH_EV_REPLY && evtext[0]) {
-                size_t n = strlen(evtext);
-                if (rlen + n < sizeof(reply) - 1) {
-                    memcpy(reply + rlen, evtext, n);
-                    rlen += n;
-                    reply[rlen] = '\0';
+
+        /* Check for @chat replies from the interceptor queue */
+        if (waiting && s_chat_q) {
+            chat_msg_t m;
+            while (xQueueReceive(s_chat_q, &m, 0) == pdTRUE) {
+                if (strcmp(m.type, "text") == 0 && m.text[0]) {
+                    /* Append partial text */
+                    strlcat(reply_accum, m.text, sizeof(reply_accum));
                     display_lock(-1);
-                    lv_label_set_text_fmt(reply_lb, "Muse: %s", reply);
+                    lv_label_set_text_fmt(reply_lb, "Muse: %s", reply_accum);
                     lv_obj_scroll_to_view(reply_lb, LV_ANIM_OFF);
                     esp_lv_adapter_unlock();
+                } else if (strcmp(m.type, "done") == 0 ||
+                           strcmp(m.type, "message_done") == 0) {
+                    waiting = false;
+                    display_lock(-1);
+                    lv_obj_scroll_to_view(reply_lb, LV_ANIM_OFF);
+                    esp_lv_adapter_unlock();
+                    reply_lb = NULL;
+                    break;
+                } else if (strcmp(m.type, "error") == 0) {
+                    display_lock(-1);
+                    lv_label_set_text_fmt(reply_lb, "Error: %s", m.text[0] ? m.text : "?");
+                    esp_lv_adapter_unlock();
+                    waiting = false;
+                    reply_lb = NULL;
+                    break;
+                } else if (strcmp(m.type, "busy") == 0) {
+                    display_lock(-1);
+                    lv_label_set_text(reply_lb, "Muse: working...");
+                    esp_lv_adapter_unlock();
                 }
-            } else if (ev == MUSE_HATCH_EV_DONE) {
-                waiting = false;
-                reply_lb = NULL;
-            } else if (ev == MUSE_HATCH_EV_ERROR) {
-                display_lock(-1);
-                lv_label_set_text_fmt(reply_lb, "Error: %s", evtext);
-                esp_lv_adapter_unlock();
-                waiting = false;
-                reply_lb = NULL;
             }
         }
         vTaskDelay(pdMS_TO_TICKS(30));
     }
 }
+
 
 /* Home Link's app_main starts Muse with this board (main/main.c). */
 const muse_board_t *muse_board_get(void)

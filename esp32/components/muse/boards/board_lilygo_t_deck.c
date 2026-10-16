@@ -63,6 +63,7 @@
 #include "muse_link.h"
 #include "muse_wifi.h"
 #include "esp_system.h"  /* esp_restart */
+#include "sdkconfig.h"
 #include "esp_wifi.h"
 #include "esp_netif.h"
 #include "esp_event.h"

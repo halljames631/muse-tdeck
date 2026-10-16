@@ -203,6 +203,7 @@ static esp_err_t init(void)
 }
 
 /* ---- Direct WiFi manager (bypasses SDK Link layer) ---- */
+static bool tdeck_wifi_connect(const char *ssid, const char *pass);
 static void wifi_connect_task(void *arg)
 {
     char *ssid = (char *)arg;

@@ -60,6 +60,8 @@
 #include "muse_mem.h"
 #include "muse_settings.h"
 #include "muse_chat.h"
+#include "muse_link.h"
+#include "muse_wifi.h"
 #include "esp_system.h"  /* esp_restart */
 #include "esp_wifi.h"
 #include "esp_netif.h"
@@ -593,6 +595,42 @@ static void setup_save_cb(lv_event_t *e)
     *(bool *)lv_event_get_user_data(e) = true;
 }
 
+/* Robust WiFi: retry muse_settings_set_wifi() until Link reports connected.
+ * The keeper task may not be ready on the first try. */
+static void wifi_retry_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(20000));  /* let SDK fully boot */
+    const char *ssid = NULL;
+    const char *pass = "";
+#ifdef CONFIG_HOMEHUB_WIFI_SSID
+    if (CONFIG_HOMEHUB_WIFI_SSID[0]) {
+        ssid = CONFIG_HOMEHUB_WIFI_SSID;
+#ifdef CONFIG_HOMEHUB_WIFI_PASSWORD
+        pass = CONFIG_HOMEHUB_WIFI_PASSWORD;
+#endif
+    }
+#endif
+    if (!ssid) {
+        ESP_LOGW(TAG, "no WiFi SSID configured");
+        vTaskDelete(NULL);
+        return;
+    }
+    for (int i = 0; i < 6; i++) {
+        ESP_LOGI(TAG, "WiFi attempt %d for '%s'", i + 1, ssid);
+        muse_settings_set_wifi(ssid, pass);
+        /* Also kick the Link layer directly */
+        muse_wifi_apply();
+        vTaskDelay(pdMS_TO_TICKS(15000));
+        if (muse_wifi_connected()) {
+            ESP_LOGI(TAG, "WiFi connected!");
+            break;
+        }
+        ESP_LOGW(TAG, "WiFi not connected yet, retrying");
+    }
+    vTaskDelete(NULL);
+}
+
 static void ondevice_setup(void)
 {
     /* Revamped: connect WiFi directly via ESP-IDF. Credentials from
@@ -617,8 +655,8 @@ static void ondevice_setup(void)
     }
 #endif
     if (ssid) {
-        ESP_LOGI(TAG, "WiFi creds found for '%s' (direct connect disabled for safety)", ssid);
-        /* TODO: re-enable after confirming SDK netif init order */
+        ESP_LOGI(TAG, "starting WiFi retry task for '%s'", ssid);
+        xTaskCreate(wifi_retry_task, "tdeck_wifiretry", 4096, NULL, 5, NULL);
     } else {
         ESP_LOGW(TAG, "no WiFi credentials configured");
     }

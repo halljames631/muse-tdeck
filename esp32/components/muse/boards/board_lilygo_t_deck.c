@@ -67,6 +67,7 @@
 #include "esp_netif.h"
 #include "esp_event.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "lwip/inet.h"
 
 static const char *TAG = "tdeck";
@@ -636,9 +637,20 @@ static void ondevice_setup(void)
     /* Copy Kconfig SDK token into runtime settings if not already saved.
      * muse_hatch_configured() checks s.token, not the Kconfig value. */
 #ifdef CONFIG_GADGET_SDK_TOKEN
-    if (CONFIG_GADGET_SDK_TOKEN[0] != '\0' && muse_settings_hatch_token_len() == 0) {
-        muse_settings_set_hatch_token(CONFIG_GADGET_SDK_TOKEN, false);
-        ESP_LOGI(TAG, "saved Kconfig SDK token to settings");
+    if (CONFIG_GADGET_SDK_TOKEN[0] != '\0') {
+        if (muse_settings_hatch_token_len() == 0) {
+            muse_settings_set_hatch_token(CONFIG_GADGET_SDK_TOKEN, false);
+            ESP_LOGI(TAG, "saved Kconfig SDK token to muse settings");
+        }
+        /* Also overwrite homehub NVS (identity.c reads sdk_token from there,
+         * overriding Kconfig if present). Fixes stale token issue. */
+        nvs_handle_t h;
+        if (nvs_open("homehub", NVS_READWRITE, &h) == ESP_OK) {
+            nvs_set_str(h, "sdk_token", CONFIG_GADGET_SDK_TOKEN);
+            nvs_commit(h);
+            nvs_close(h);
+            ESP_LOGI(TAG, "wrote Kconfig SDK token to homehub NVS");
+        }
     }
 #endif
     /* Revamped: connect WiFi directly via ESP-IDF. Credentials from

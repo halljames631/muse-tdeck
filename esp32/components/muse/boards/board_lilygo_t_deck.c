@@ -17,7 +17,8 @@
 /*
  * LILYGO T-Deck: ESP32-S3FN16R8 (16 MB flash, 8 MB octal PSRAM),
  * 2.8" 320x240 ST7789 on SPI, GT911 touch, ES7210 dual-mic ADC,
- * MAX98357A I2S speaker amp, BOOT on GPIO0, native USB Serial/JTAG.
+ * MAX98357A I2S speaker amp and ES7210 mic (both uninitialized:
+ * display-only for now), BOOT on GPIO0, native USB Serial/JTAG.
  *
  * Pin source: Xinyuan-LilyGO/T-Deck (MIT), examples/*/utilities.h and
  * Microphone.ino / I2SPlay.ino / Touchpad.ino, schematic/schematic.pdf.
@@ -27,13 +28,13 @@
  * Touch orientation: vendor Touchpad example, setSwapXY(true) and
  * setMirrorXY(false, true) at 320x240.
  *
- * Display/touch/audio structure follows the in-repo AIPI (ST7789 +
- * esp_lv_adapter, hand-driven), Waveshare LCD-7 (GT911) and EchoEar-2ST
- * (ES7210) boards. Live audio and touch verification still required.
+ * Display/touch structure follows the in-repo AIPI (ST7789 +
+ * esp_lv_adapter, hand-driven) and Waveshare LCD-7 (GT911) boards.
+ * Audio (MAX98357A/ES7210) is intentionally uninitialized for now:
+ * display-only bring-up. Touch verification still required.
  */
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
-#include "driver/i2s_std.h"
 #include "driver/ledc.h"
 #include "driver/spi_master.h"
 #include "driver/usb_serial_jtag.h"
@@ -41,7 +42,6 @@
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_check.h"
-#include "esp_codec_dev_defaults.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_vendor.h"
@@ -52,7 +52,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#include "muse_audio.h"
 #include "muse_board.h"
 #include "muse_mem.h"
 
@@ -75,12 +74,12 @@ static const char *TAG = "tdeck";
 #define I2C_SCL GPIO_NUM_8
 #define TOUCH_INT GPIO_NUM_16
 
-/* MAX98357A speaker amp: I2S0 TX. No MCLK, no control interface. */
+/* MAX98357A speaker amp: I2S0 TX (not initialized yet). */
 #define SPK_BCK  GPIO_NUM_7
 #define SPK_WS   GPIO_NUM_5
 #define SPK_DOUT GPIO_NUM_6
 
-/* ES7210 dual-mic ADC: I2S1 RX, controlled over I2C at 0x40. */
+/* ES7210 dual-mic ADC: I2S1 RX at 0x40 (not initialized yet). */
 #define MIC_MCLK GPIO_NUM_48
 #define MIC_WS   GPIO_NUM_21
 #define MIC_BCK  GPIO_NUM_47
@@ -305,165 +304,9 @@ static void display_pause(bool pause)
     }
 }
 
-/*
- * MAX98357A: fixed-function I2S DAC+amp with no control interface.
- * esp_codec_dev still needs an audio_codec_if_t, so implement the
- * documented no-op codec (cf. the "dummy codec" section of the
- * esp_codec_dev README). Every op succeeds; set_vol is a no-op because
- * the gain is fixed in hardware, so Muse's volume slider has no effect
- * on this board.
+/* Audio (MAX98357A speaker, ES7210 mic) is not initialized
+ * yet: this board runs display-only until the codec plumbing lands.
  */
-static esp_err_t max98357a_open(const audio_codec_if_t *h,
-                                audio_codec_data_if_t *data_if, int rate,
-                                int bits, int ch)
-{
-    (void)h;
-    (void)data_if;
-    (void)rate;
-    (void)bits;
-    (void)ch;
-    return ESP_OK;
-}
-
-static esp_err_t max98357a_enable(const audio_codec_if_t *h, bool enable)
-{
-    (void)h;
-    (void)enable;
-    return ESP_OK;
-}
-
-static esp_err_t max98357a_set_fs(const audio_codec_if_t *h, int rate,
-                                  int bits, int ch)
-{
-    (void)h;
-    (void)rate;
-    (void)bits;
-    (void)ch;
-    return ESP_OK;
-}
-
-static esp_err_t max98357a_set_vol(const audio_codec_if_t *h, int vol)
-{
-    (void)h;
-    (void)vol;
-    return ESP_OK;  /* fixed hardware gain */
-}
-
-static esp_err_t max98357a_set_mic_gain(const audio_codec_if_t *h, int gain)
-{
-    (void)h;
-    (void)gain;
-    return ESP_OK;
-}
-
-static esp_err_t max98357a_close(const audio_codec_if_t *h)
-{
-    (void)h;
-    return ESP_OK;
-}
-
-static const audio_codec_if_t s_max98357a_codec = {
-    .open = max98357a_open,
-    .enable = max98357a_enable,
-    .set_fs = max98357a_set_fs,
-    .set_vol = max98357a_set_vol,
-    .set_mic_gain = max98357a_set_mic_gain,
-    .close = max98357a_close,
-};
-
-/* Two I2S peripherals: I2S0 TX feeds the MAX98357A speaker amp, I2S1 RX
- * captures the ES7210 dual-mic ADC. Both run at MUSE_AUDIO_RATE (16 kHz),
- * matching the vendor's own 16 kHz examples. */
-static esp_err_t audio_init(esp_codec_dev_handle_t *spk,
-                            esp_codec_dev_handle_t *mic)
-{
-    i2s_chan_handle_t tx;
-    i2s_chan_config_t tx_chan_cfg =
-        I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    tx_chan_cfg.auto_clear = true;
-    ESP_RETURN_ON_ERROR(i2s_new_channel(&tx_chan_cfg, &tx, NULL), TAG,
-                        "spk i2s channel");
-    const i2s_std_config_t tx_std = {
-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(MUSE_AUDIO_RATE),
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
-            I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
-        .gpio_cfg = {
-            .mclk = GPIO_NUM_NC,  /* MAX98357A needs no MCLK */
-            .bclk = SPK_BCK,
-            .ws = SPK_WS,
-            .dout = SPK_DOUT,
-            .din = GPIO_NUM_NC,
-        },
-    };
-    ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(tx, &tx_std), TAG,
-                        "spk i2s init");
-    ESP_RETURN_ON_ERROR(i2s_channel_enable(tx), TAG, "spk i2s enable");
-
-    audio_codec_i2s_cfg_t spk_data_cfg = {
-        .port = I2S_NUM_0, .rx_handle = NULL, .tx_handle = tx,
-    };
-    const audio_codec_data_if_t *spk_data =
-        audio_codec_new_i2s_data(&spk_data_cfg);
-    ESP_RETURN_ON_FALSE(spk_data, ESP_ERR_NO_MEM, TAG, "spk data if");
-    esp_codec_dev_cfg_t spk_cfg = {
-        .dev_type = ESP_CODEC_DEV_TYPE_OUT,
-        .codec_if = &s_max98357a_codec,
-        .data_if = spk_data,
-    };
-    *spk = esp_codec_dev_new(&spk_cfg);
-
-    ESP_RETURN_ON_ERROR(i2c_master_probe(s_i2c, ES7210_ADDR, 100), TAG,
-                        "ES7210 probe");
-    i2s_chan_handle_t rx;
-    i2s_chan_config_t rx_chan_cfg =
-        I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
-    ESP_RETURN_ON_ERROR(i2s_new_channel(&rx_chan_cfg, NULL, &rx), TAG,
-                        "mic i2s channel");
-    const i2s_std_config_t rx_std = {
-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(MUSE_AUDIO_RATE),
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
-            I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
-        .gpio_cfg = {
-            .mclk = MIC_MCLK,
-            .bclk = MIC_BCK,
-            .ws = MIC_WS,
-            .dout = GPIO_NUM_NC,
-            .din = MIC_DIN,
-        },
-    };
-    ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(rx, &rx_std), TAG,
-                        "mic i2s init");
-    ESP_RETURN_ON_ERROR(i2s_channel_enable(rx), TAG, "mic i2s enable");
-
-    audio_codec_i2s_cfg_t mic_data_cfg = {
-        .port = I2S_NUM_1, .rx_handle = rx, .tx_handle = NULL,
-    };
-    const audio_codec_data_if_t *mic_data =
-        audio_codec_new_i2s_data(&mic_data_cfg);
-    audio_codec_i2c_cfg_t mic_ctrl_cfg = {
-        .port = I2C_NUM_0, .addr = ES7210_ADDR, .bus_handle = s_i2c,
-    };
-    const audio_codec_ctrl_if_t *mic_ctrl =
-        audio_codec_new_i2c_ctrl(&mic_ctrl_cfg);
-    ESP_RETURN_ON_FALSE(mic_data && mic_ctrl, ESP_ERR_NO_MEM, TAG,
-                        "mic interfaces");
-    es7210_codec_cfg_t adc = {
-        .ctrl_if = mic_ctrl,
-        .mic_selected = ES7210_SEL_MIC1 | ES7210_SEL_MIC2,
-    };
-    const audio_codec_if_t *mic_codec = es7210_codec_new(&adc);
-    ESP_RETURN_ON_FALSE(mic_codec, ESP_FAIL, TAG, "ES7210 init");
-    esp_codec_dev_cfg_t mic_cfg = {
-        .dev_type = ESP_CODEC_DEV_TYPE_IN,
-        .codec_if = mic_codec,
-        .data_if = mic_data,
-    };
-    *mic = esp_codec_dev_new(&mic_cfg);
-    ESP_RETURN_ON_FALSE(*spk && *mic, ESP_FAIL, TAG, "codec handles");
-    ESP_LOGI(TAG, "MAX98357A speaker + ES7210 mic ready;"
-                  " live audio test still required");
-    return ESP_OK;
-}
 
 static unsigned poll_buttons(void)
 {
@@ -537,9 +380,7 @@ static const muse_board_t s_board = {
     .set_brightness = set_brightness,
     .panel_sleep = panel_sleep,
     .display_pause = display_pause,
-    .audio_init = audio_init,
-    .mic_slot = -1,  /* mix both ES7210 mics */
-    .set_mic_gain = NULL,  /* esp_codec_dev drives the ES7210 gain */
+    .audio_init = NULL,  /* display-only: no speaker/mic yet */
     .poll_buttons = poll_buttons,
     .wait_buttons = wait_buttons,
     .read_power = read_power,

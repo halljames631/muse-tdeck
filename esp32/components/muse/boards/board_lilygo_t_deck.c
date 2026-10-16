@@ -716,7 +716,7 @@ static void chat_task(void *arg)
 
     display_lock(-1);
     chat_add_message(hist, "Sys", "T-Deck Muse Chat. Type below, Enter sends.");
-    if (!s_wifi_connected) {
+    if (!muse_wifi_connected()) {
         chat_add_message(hist, "Sys", "Waiting for WiFi...");
     }
     esp_lv_adapter_unlock();
@@ -728,9 +728,10 @@ static void chat_task(void *arg)
     char reply_accum[4096] = {0};
 
     while (1) {
-        /* Update WiFi status */
+        /* Update WiFi status (use Link API, not our disabled direct var) */
+        bool wup = muse_wifi_connected();
         display_lock(-1);
-        lv_label_set_text(status, s_wifi_connected ? "WiFi OK" : "Connecting WiFi...");
+        lv_label_set_text(status, wup ? "WiFi OK - type below" : "Connecting WiFi...");
         esp_lv_adapter_unlock();
 
         /* Keyboard input */
@@ -745,7 +746,7 @@ static void chat_task(void *arg)
                 ibuf[--ilen] = '\0';
                 lv_textarea_set_text(input, ibuf);
             } else if ((k == '\r' || k == '\n') && ilen > 0) {
-                if (!s_wifi_connected) {
+                if (!muse_wifi_connected()) {
                     chat_add_message(hist, "Sys", "No WiFi yet, can't send.");
                 } else {
                     chat_add_message(hist, "You", ibuf);

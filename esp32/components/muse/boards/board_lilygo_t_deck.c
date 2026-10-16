@@ -55,6 +55,7 @@
 #include "muse_board.h"
 #include "muse_mem.h"
 #include "muse_settings.h"
+#include "muse_chat.h"
 #include "esp_system.h"  /* esp_restart */
 
 static const char *TAG = "tdeck";
@@ -318,6 +319,7 @@ static lv_display_t *display_start(lv_indev_t **touch)
         return NULL;
     }
     ondevice_setup();
+    xTaskCreate(chat_task, "tdeck_chat", 8192, NULL, 5, NULL);
     return disp;
 }
 
@@ -578,6 +580,114 @@ static void ondevice_setup(void)
         esp_restart();
     }
     /* Skipped or nothing entered: the SDK shows its own setup screen. */
+}
+
+
+/* ---- On-device chat ----
+ *
+ * A standalone text terminal on the T-Deck: type on the physical keyboard,
+ * Enter sends via muse_hatch_text_turn(), replies stream back through
+ * muse_hatch_turn_event() and appear on screen. Starts after the SDK's UI
+ * is up, then takes over the display. */
+
+/* Caller must hold the display lock. */
+static void chat_add_message(lv_obj_t *hist, const char *who, const char *text)
+{
+    lv_obj_t *lb = lv_label_create(hist);
+    lv_label_set_text_fmt(lb, "%s: %s", who, text);
+    lv_label_set_long_mode(lb, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(lb, 296);
+    lv_obj_scroll_to_view(lb, LV_ANIM_OFF);
+}
+
+static void chat_task(void *arg)
+{
+    /* Let the SDK finish building its UI before we take the screen. */
+    vTaskDelay(pdMS_TO_TICKS(5000));
+
+    display_lock(-1);
+    lv_obj_t *scr = lv_obj_create(NULL);
+    lv_screen_load(scr);
+    lv_obj_t *hist = lv_obj_create(scr);
+    lv_obj_set_size(hist, 320, 188);
+    lv_obj_set_pos(hist, 0, 0);
+    lv_obj_set_flex_flow(hist, LV_FLEX_FLOW_COLUMN);
+    lv_obj_t *input = lv_textarea_create(scr);
+    lv_textarea_set_one_line(input, true);
+    lv_textarea_set_max_length(input, 512);
+    lv_obj_set_size(input, 310, 36);
+    lv_obj_set_pos(input, 5, 196);
+    esp_lv_adapter_unlock();
+
+    display_lock(-1);
+    chat_add_message(hist, "Sys", "Type a message below, Enter sends.");
+    esp_lv_adapter_unlock();
+
+    char ibuf[513];
+    size_t ilen = 0;
+    char reply[8192];
+    size_t rlen = 0;
+    bool waiting = false;
+    lv_obj_t *reply_lb = NULL;
+
+    while (1) {
+        char k = keyboard_poll();
+        if (k && !waiting) {
+            display_lock(-1);
+            if (k >= 0x20 && k <= 0x7E && ilen < sizeof(ibuf) - 1) {
+                ibuf[ilen++] = k;
+                ibuf[ilen] = '\0';
+                lv_textarea_set_text(input, ibuf);
+            } else if ((k == 0x08 || k == 0x7F) && ilen > 0) {
+                ibuf[--ilen] = '\0';
+                lv_textarea_set_text(input, ibuf);
+            } else if ((k == '\r' || k == '\n') && ilen > 0) {
+                chat_add_message(hist, "You", ibuf);
+                char *msg = strdup(ibuf);
+                ibuf[0] = '\0';
+                ilen = 0;
+                lv_textarea_set_text(input, "");
+                /* Unlock around the send; it can block. */
+                esp_lv_adapter_unlock();
+                muse_hatch_text_turn(msg);  /* frees msg */
+                display_lock(-1);
+                waiting = true;
+                rlen = 0;
+                reply[0] = '\0';
+                reply_lb = lv_label_create(hist);
+                lv_label_set_text(reply_lb, "Muse: ...");
+                lv_label_set_long_mode(reply_lb, LV_LABEL_LONG_WRAP);
+                lv_obj_set_width(reply_lb, 296);
+            }
+            esp_lv_adapter_unlock();
+        }
+        if (waiting) {
+            char evtext[1024];
+            muse_hatch_ev_t ev = muse_hatch_turn_event(evtext, sizeof(evtext));
+            if (ev == MUSE_HATCH_EV_REPLY && evtext[0]) {
+                size_t n = strlen(evtext);
+                if (rlen + n < sizeof(reply) - 1) {
+                    memcpy(reply + rlen, evtext, n);
+                    rlen += n;
+                    reply[rlen] = '\0';
+                    display_lock(-1);
+                    lv_label_set_text_fmt(reply_lb, "Muse: %s", reply);
+                    lv_obj_scroll_to_view(reply_lb, LV_ANIM_OFF);
+                    esp_lv_adapter_unlock();
+                }
+            } else if (ev == MUSE_HATCH_EV_DONE) {
+                waiting = false;
+                reply_lb = NULL;
+            } else if (ev == MUSE_HATCH_EV_ERROR) {
+                display_lock(-1);
+                lv_label_set_text_fmt(reply_lb, "Error: %s", evtext);
+                esp_lv_adapter_unlock();
+                waiting = false;
+                reply_lb = NULL;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(30));
+    }
 }
 
 /* Home Link's app_main starts Muse with this board (main/main.c). */

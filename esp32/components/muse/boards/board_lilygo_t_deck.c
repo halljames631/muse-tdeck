@@ -447,6 +447,13 @@ static void setup_save_cb(lv_event_t *e)
 
 static void ondevice_setup(void)
 {
+    /* Hard-coded WiFi from the local sdkconfig: persist it so the check
+     * below (and the SDK) see it. The values never leave the device. */
+#ifdef CONFIG_TDECK_WIFI_SSID
+    if (CONFIG_TDECK_WIFI_SSID[0] != '\0') {
+        muse_settings_set_wifi(CONFIG_TDECK_WIFI_SSID, CONFIG_TDECK_WIFI_PASS);
+    }
+#endif
     char ssid[MUSE_SSID_MAX + 1] = {0};
     char pass[MUSE_PASS_MAX + 1] = {0};
     muse_settings_wifi(ssid, pass);

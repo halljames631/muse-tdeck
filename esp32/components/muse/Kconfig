@@ -252,4 +252,20 @@ menu "Muse"
             (about 220 KB), which still covers a push-to-talk turn. Board
             overlays with 2 MB of PSRAM turn it on.
 
+    config TDECK_WIFI_SSID
+        string "T-Deck: hard-coded WiFi SSID (local sdkconfig only)"
+        default ""
+        help
+            If set, the T-Deck joins this WiFi network at boot instead of
+            showing the on-device setup screen. Set this in your local
+            sdkconfig (which is never committed to git), not in any file
+            that gets pushed.
+
+    config TDECK_WIFI_PASS
+        string "T-Deck: hard-coded WiFi password (local sdkconfig only)"
+        default ""
+        help
+            Password for TDECK_WIFI_SSID. Same local-only warning: keep it
+            out of git.
+
 endmenu

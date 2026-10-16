@@ -456,8 +456,30 @@ static void ondevice_setup(void)
     if (CONFIG_TDECK_WIFI_SSID[0] != '\0') {
         muse_settings_set_wifi(CONFIG_TDECK_WIFI_SSID, CONFIG_TDECK_WIFI_PASS);
         ESP_LOGI(TAG, "using hard-coded WiFi '%s'", CONFIG_TDECK_WIFI_SSID);
+        /* TEMP DEBUG: show the SSID on screen for 4s */
+        display_lock(-1);
+        lv_obj_t *dbg = lv_label_create(lv_screen_active());
+        lv_label_set_text_fmt(dbg, "DEBUG SSID:[%s]\nlen=%d", CONFIG_TDECK_WIFI_SSID,
+                              (int)strlen(CONFIG_TDECK_WIFI_SSID));
+        lv_obj_center(dbg);
+        display_unlock();
+        vTaskDelay(pdMS_TO_TICKS(4000));
+        display_lock(-1);
+        lv_obj_del(dbg);
+        display_unlock();
         return;
     }
+#else
+    /* TEMP DEBUG: Kconfig WiFi not defined! */
+    display_lock(-1);
+    lv_obj_t *dbg2 = lv_label_create(lv_screen_active());
+    lv_label_set_text(dbg2, "DEBUG: TDECK_WIFI_SSID NOT DEFINED");
+    lv_obj_center(dbg2);
+    display_unlock();
+    vTaskDelay(pdMS_TO_TICKS(4000));
+    display_lock(-1);
+    lv_obj_del(dbg2);
+    display_unlock();
 #endif
     char ssid[MUSE_SSID_MAX + 1] = {0};
     char pass[MUSE_PASS_MAX + 1] = {0};

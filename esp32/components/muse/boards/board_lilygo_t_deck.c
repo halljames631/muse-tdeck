@@ -462,11 +462,11 @@ static void ondevice_setup(void)
         lv_label_set_text_fmt(dbg, "DEBUG SSID:[%s]\nlen=%d", CONFIG_TDECK_WIFI_SSID,
                               (int)strlen(CONFIG_TDECK_WIFI_SSID));
         lv_obj_center(dbg);
-        display_unlock();
+        esp_lv_adapter_unlock();
         vTaskDelay(pdMS_TO_TICKS(4000));
         display_lock(-1);
         lv_obj_del(dbg);
-        display_unlock();
+        esp_lv_adapter_unlock();
         return;
     }
 #else
@@ -475,11 +475,11 @@ static void ondevice_setup(void)
     lv_obj_t *dbg2 = lv_label_create(lv_screen_active());
     lv_label_set_text(dbg2, "DEBUG: TDECK_WIFI_SSID NOT DEFINED");
     lv_obj_center(dbg2);
-    display_unlock();
+    esp_lv_adapter_unlock();
     vTaskDelay(pdMS_TO_TICKS(4000));
     display_lock(-1);
     lv_obj_del(dbg2);
-    display_unlock();
+    esp_lv_adapter_unlock();
 #endif
     char ssid[MUSE_SSID_MAX + 1] = {0};
     char pass[MUSE_PASS_MAX + 1] = {0};

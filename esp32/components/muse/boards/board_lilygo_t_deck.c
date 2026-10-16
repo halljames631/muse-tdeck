@@ -682,6 +682,8 @@ static void chat_add_message(lv_obj_t *hist, const char *who, const char *text)
 static void chat_task(void *arg)
 {
     (void)arg;
+    /* Wait for SDK UI to settle before taking over the screen. */
+    vTaskDelay(pdMS_TO_TICKS(12000));
     /* Revamped chat: full-screen UI, keyboard input.
      * NOTE: console interceptor disabled (caused black screen). */
     /* chat_intercept_init(); */

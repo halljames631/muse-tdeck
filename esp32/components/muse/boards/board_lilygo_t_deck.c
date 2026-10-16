@@ -635,7 +635,7 @@ static void wifi_retry_task(void *arg)
 
 static void ondevice_setup(void)
 {
-    ESP_LOGW(TAG, "=== ondevice_setup() RUNNING ===");
+    printf("\n\n*** TDECK ondevice_setup() RUNNING ***\n\n"); fflush(stdout);
     /* Copy Kconfig SDK token into runtime settings if not already saved.
      * muse_hatch_configured() checks s.token, not the Kconfig value. */
 #ifdef CONFIG_GADGET_SDK_TOKEN

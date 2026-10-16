@@ -56,8 +56,6 @@
 #include "muse_mem.h"
 #include "muse_settings.h"
 #include "muse_chat.h"
-#include "nvs_flash.h"
-#include "nvs.h"
 #include "esp_system.h"  /* esp_restart */
 
 static const char *TAG = "tdeck";
@@ -193,39 +191,6 @@ static esp_err_t init(void)
         s_cali = NULL;
     }
     return ESP_OK;
-}
-
-/* WiFi persistence that survives reboot. muse_settings_set_wifi() delegates
- * to Home Link (RAM-only), so we also write straight to the muse NVS
- * namespace and read it back directly for the setup check. */
-static bool wifi_nvs_get(char *ssid, size_t ssid_cap, char *pass, size_t pass_cap)
-{
-    nvs_handle_t h;
-    if (nvs_open("muse", NVS_READONLY, &h) != ESP_OK) {
-        return false;
-    }
-    size_t n = ssid_cap;
-    bool ok = nvs_get_str(h, "ssid", ssid, &n) == ESP_OK && ssid[0] != '\0';
-    if (ok && pass) {
-        n = pass_cap;
-        if (nvs_get_str(h, "pass", pass, &n) != ESP_OK) {
-            pass[0] = '\0';
-        }
-    }
-    nvs_close(h);
-    return ok;
-}
-
-static void wifi_nvs_set(const char *ssid, const char *pass)
-{
-    nvs_handle_t h;
-    if (nvs_open("muse", NVS_READWRITE, &h) != ESP_OK) {
-        return;
-    }
-    nvs_set_str(h, "ssid", ssid ? ssid : "");
-    nvs_set_str(h, "pass", (ssid && ssid[0] && pass) ? pass : "");
-    nvs_commit(h);
-    nvs_close(h);
 }
 
 static void ondevice_setup(void);
@@ -485,22 +450,19 @@ static void setup_save_cb(lv_event_t *e)
 
 static void ondevice_setup(void)
 {
-    /* Hard-coded WiFi from the local sdkconfig: persist it and skip setup. */
+    /* Hard-coded WiFi from the local sdkconfig: hand to Link, skip setup. */
 #ifdef CONFIG_TDECK_WIFI_SSID
     if (CONFIG_TDECK_WIFI_SSID[0] != '\0') {
         muse_settings_set_wifi(CONFIG_TDECK_WIFI_SSID, CONFIG_TDECK_WIFI_PASS);
-        wifi_nvs_set(CONFIG_TDECK_WIFI_SSID, CONFIG_TDECK_WIFI_PASS);
+        ESP_LOGI(TAG, "using hard-coded WiFi '%s'", CONFIG_TDECK_WIFI_SSID);
         return;
     }
 #endif
     char ssid[MUSE_SSID_MAX + 1] = {0};
     char pass[MUSE_PASS_MAX + 1] = {0};
-    /* Read NVS directly: muse_settings_wifi() is intercepted by Home Link. */
-    if (wifi_nvs_get(ssid, sizeof(ssid), pass, sizeof(pass)) &&
-        gpio_get_level(TALK_GPIO) != 0) {
-        /* Saved WiFi exists: hand it to Link so it connects now. */
-        muse_settings_set_wifi(ssid, pass);
-        return;
+    muse_settings_wifi(ssid, pass);
+    if (ssid[0] != '\0' && gpio_get_level(TALK_GPIO) != 0) {
+        return;  /* already provisioned and BOOT not held */
     }
 
     ESP_LOGI(TAG, "on-device setup: type credentials on the keyboard");
@@ -603,8 +565,7 @@ static void ondevice_setup(void)
         const char *pw = lv_textarea_get_text(tas[1]);
         const char *t = nfields > 2 ? lv_textarea_get_text(tas[2]) : "";
         if (s[0] != '\0') {
-            muse_settings_set_wifi(s, pw);  /* Link connects now */
-            wifi_nvs_set(s, pw);            /* survives reboot */
+            muse_settings_set_wifi(s, pw);
             ESP_LOGI(TAG, "wifi saved for '%s'", s);
             changed = true;
         }

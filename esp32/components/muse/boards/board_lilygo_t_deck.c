@@ -463,7 +463,10 @@ static void ondevice_setup(void)
     char pass[MUSE_PASS_MAX + 1] = {0};
     muse_settings_wifi(ssid, pass);
     if (ssid[0] != '\0' && gpio_get_level(TALK_GPIO) != 0) {
-        return;  /* already provisioned and BOOT not held */
+        /* Already provisioned: push to Link so the WiFi driver sees it. */
+        muse_settings_set_wifi(ssid, pass);
+        ESP_LOGI(TAG, "using saved WiFi '%s'", ssid);
+        return;
     }
 
     ESP_LOGI(TAG, "on-device setup: type credentials on the keyboard");

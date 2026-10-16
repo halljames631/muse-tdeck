@@ -449,40 +449,21 @@ static void setup_save_cb(lv_event_t *e)
     *(bool *)lv_event_get_user_data(e) = true;
 }
 
-/* Deferred WiFi: the keeper task (which processes WiFi credentials) may not
- * be running yet when display_start() calls ondevice_setup(). Wait 10s,
- * then push the credentials via muse_settings_set_wifi(). */
-static void deferred_wifi_task(void *arg)
+static void ondevice_setup(void)
 {
-    (void)arg;
-    vTaskDelay(pdMS_TO_TICKS(10000));
-#ifdef CONFIG_TDECK_WIFI_SSID
-    if (CONFIG_TDECK_WIFI_SSID[0] != '\0') {
-        muse_settings_set_wifi(CONFIG_TDECK_WIFI_SSID, CONFIG_TDECK_WIFI_PASS);
-        ESP_LOGI(TAG, "deferred WiFi set to '%s'", CONFIG_TDECK_WIFI_SSID);
-        vTaskDelete(NULL);
+    /* SDK dev override: CONFIG_HOMEHUB_WIFI_SSID connects automatically at
+     * boot (see main/app.c). If set, skip our setup screen entirely. */
+#ifdef CONFIG_HOMEHUB_WIFI_SSID
+    if (CONFIG_HOMEHUB_WIFI_SSID[0] != '\0') {
+        ESP_LOGI(TAG, "HOMEHUB_WIFI_SSID override active ('%s'); skipping setup",
+                 CONFIG_HOMEHUB_WIFI_SSID);
         return;
     }
 #endif
-    char ssid[MUSE_SSID_MAX + 1] = {0};
-    char pass[MUSE_PASS_MAX + 1] = {0};
-    muse_settings_wifi(ssid, pass);
-    if (ssid[0] != '\0') {
-        muse_settings_set_wifi(ssid, pass);
-        ESP_LOGI(TAG, "deferred WiFi set to saved '%s'", ssid);
-    } else {
-        ESP_LOGW(TAG, "deferred WiFi: no credentials found");
-    }
-    vTaskDelete(NULL);
-}
-
-static void ondevice_setup(void)
-{
-    /* Hard-coded WiFi from the local sdkconfig: hand to Link, skip setup. */
 #ifdef CONFIG_TDECK_WIFI_SSID
     if (CONFIG_TDECK_WIFI_SSID[0] != '\0') {
-        ESP_LOGI(TAG, "scheduling deferred WiFi for '%s'", CONFIG_TDECK_WIFI_SSID);
-        xTaskCreate(deferred_wifi_task, "tdeck_wifi", 4096, NULL, 5, NULL);
+        muse_settings_set_wifi(CONFIG_TDECK_WIFI_SSID, CONFIG_TDECK_WIFI_PASS);
+        ESP_LOGI(TAG, "using TDECK hard-coded WiFi '%s'", CONFIG_TDECK_WIFI_SSID);
         return;
     }
 #endif
@@ -490,9 +471,7 @@ static void ondevice_setup(void)
     char pass[MUSE_PASS_MAX + 1] = {0};
     muse_settings_wifi(ssid, pass);
     if (ssid[0] != '\0' && gpio_get_level(TALK_GPIO) != 0) {
-        /* Already provisioned: defer push until WiFi stack is ready. */
-        ESP_LOGI(TAG, "scheduling deferred WiFi for saved '%s'", ssid);
-        xTaskCreate(deferred_wifi_task, "tdeck_wifi", 4096, NULL, 5, NULL);
+        ESP_LOGI(TAG, "saved WiFi '%s' found; skipping setup", ssid);
         return;
     }
 

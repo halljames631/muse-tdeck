@@ -20,8 +20,8 @@
  * MAX98357A I2S speaker amp and ES7210 mic (both uninitialized:
  * display-only for now), BOOT on GPIO0, native USB Serial/JTAG.
  *
- * Pin source: Xinyuan-LilyGO/T-Deck (MIT), examples/*/utilities.h and
- * Microphone.ino / I2SPlay.ino / Touchpad.ino, schematic/schematic.pdf.
+ * Pin source: Xinyuan-LilyGO/T-Deck (MIT): its utilities header and
+ * the Microphone, I2SPlay and Touchpad examples, plus schematic.pdf.
  * ST7789 orientation: the vendor runs TFT_eSPI setRotation(1) (landscape),
  * which programs MADCTL = MX|MV; esp_lcd's swap_xy(true)+mirror(true,false)
  * is the same setting (lib/TFT_eSPI/TFT_Drivers/ST7789_Rotation.h).

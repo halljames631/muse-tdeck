@@ -464,6 +464,7 @@ static void ondevice_setup(void)
         return;
     }
 
+    display_lock(-1);  /* LVGL is not thread-safe; the render task is running */
     lv_obj_t *title = lv_label_create(scr);
     lv_label_set_text(title, "DEVICE SETUP");
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 6);
@@ -509,8 +510,11 @@ static void ondevice_setup(void)
         lv_obj_set_style_border_width(tas[i], i == focus ? 2 : 0,
                                       LV_PART_MAIN);
     }
+    esp_lv_adapter_unlock();
     while (!done) {
         char k = keyboard_poll();
+        if (k) {
+            display_lock(-1);
         if (k >= 0x20 && k <= 0x7E) {
             lv_textarea_add_char(tas[focus], (uint32_t)(unsigned char)k);
         } else if (k == 0x08 || k == 0x7F) {
@@ -527,11 +531,14 @@ static void ondevice_setup(void)
         } else if (k == 0x1B) {
             done = true;  /* ESC: skip */
         }
+            esp_lv_adapter_unlock();
+        }
         if (save) {
             done = true;
         }
         vTaskDelay(pdMS_TO_TICKS(30));
     }
+    display_lock(-1);
 
     bool changed = false;
     if (save) {
@@ -550,6 +557,7 @@ static void ondevice_setup(void)
         }
     }
     lv_obj_clean(scr);  /* remove our widgets; leave the screen for the SDK */
+    esp_lv_adapter_unlock();
     if (changed) {
         vTaskDelay(pdMS_TO_TICKS(300));
         esp_restart();

@@ -56,6 +56,7 @@
 #include "muse_mem.h"
 #include "muse_settings.h"
 #include "esp_system.h"  /* esp_restart */
+#include "esp_task_wdt.h"
 
 static const char *TAG = "tdeck";
 
@@ -506,6 +507,7 @@ static void ondevice_setup(void)
                                       LV_PART_MAIN);
     }
     while (!done) {
+        esp_task_wdt_reset();  /* this loop waits on the user; keep TWDT happy */
         char k = keyboard_poll();
         if (k >= 0x20 && k <= 0x7E) {
             lv_textarea_add_char(tas[focus], (uint32_t)(unsigned char)k);

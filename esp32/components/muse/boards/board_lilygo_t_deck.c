@@ -647,8 +647,24 @@ static void ondevice_setup(void)
         }
         /* Also overwrite homehub NVS (identity.c reads sdk_token from there,
          * overriding Kconfig if present). Fixes stale token issue. */
+        /* Write to BOTH NVS namespaces:
+         * - homehub/sdk_token (for identity_sdk_token)
+         * - muse/token (for muse_settings_hatch_token, used by fetch_vms) */
         nvs_handle_t h;
         bool need_reboot = false;
+        if (nvs_open("muse", NVS_READWRITE, &h) == ESP_OK) {
+            char cur[64] = {0};
+            size_t len = sizeof(cur);
+            bool same = (nvs_get_str(h, "token", cur, &len) == ESP_OK &&
+                         strcmp(cur, CONFIG_GADGET_SDK_TOKEN) == 0);
+            if (!same) {
+                nvs_set_str(h, "token", CONFIG_GADGET_SDK_TOKEN);
+                nvs_commit(h);
+                printf("*** Wrote token to muse NVS ***\n"); fflush(stdout);
+                need_reboot = true;
+            }
+            nvs_close(h);
+        }
         if (nvs_open("homehub", NVS_READWRITE, &h) == ESP_OK) {
             char cur[64] = {0};
             size_t len = sizeof(cur);

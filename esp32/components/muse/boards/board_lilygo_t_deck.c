@@ -645,11 +645,23 @@ static void ondevice_setup(void)
         /* Also overwrite homehub NVS (identity.c reads sdk_token from there,
          * overriding Kconfig if present). Fixes stale token issue. */
         nvs_handle_t h;
+        bool need_reboot = false;
         if (nvs_open("homehub", NVS_READWRITE, &h) == ESP_OK) {
-            nvs_set_str(h, "sdk_token", CONFIG_GADGET_SDK_TOKEN);
-            nvs_commit(h);
+            char cur[64] = {0};
+            size_t len = sizeof(cur);
+            bool same = (nvs_get_str(h, "sdk_token", cur, &len) == ESP_OK &&
+                         strcmp(cur, CONFIG_GADGET_SDK_TOKEN) == 0);
+            if (!same) {
+                nvs_set_str(h, "sdk_token", CONFIG_GADGET_SDK_TOKEN);
+                nvs_commit(h);
+                ESP_LOGI(TAG, "wrote new SDK token to homehub NVS; rebooting");
+                need_reboot = true;
+            }
             nvs_close(h);
-            ESP_LOGI(TAG, "wrote Kconfig SDK token to homehub NVS");
+        }
+        if (need_reboot) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            esp_restart();
         }
     }
 #endif

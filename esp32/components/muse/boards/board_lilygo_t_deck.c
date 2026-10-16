@@ -633,6 +633,14 @@ static void wifi_retry_task(void *arg)
 
 static void ondevice_setup(void)
 {
+    /* Copy Kconfig SDK token into runtime settings if not already saved.
+     * muse_hatch_configured() checks s.token, not the Kconfig value. */
+#ifdef CONFIG_GADGET_SDK_TOKEN
+    if (CONFIG_GADGET_SDK_TOKEN[0] != '\0' && muse_settings_hatch_token_len() == 0) {
+        muse_settings_set_hatch_token(CONFIG_GADGET_SDK_TOKEN, false);
+        ESP_LOGI(TAG, "saved Kconfig SDK token to settings");
+    }
+#endif
     /* Revamped: connect WiFi directly via ESP-IDF. Credentials from
      * CONFIG_HOMEHUB_WIFI_SSID/PASSWORD (SDK standard), or TDECK_ fallback.
      * The chat task shows the UI; this just ensures network is up. */

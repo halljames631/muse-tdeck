@@ -449,6 +449,23 @@ static void setup_save_cb(lv_event_t *e)
     *(bool *)lv_event_get_user_data(e) = true;
 }
 
+/* Push the SDK's HOMEHUB_WIFI_SSID override into the Link layer after boot.
+ * The override in app_run() connects via wifi_mgr directly, but the Muse UI
+ * and tunnel read status from Link (muse_glue.c), which needs s_ssid set. */
+static void link_wifi_push_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(15000));  /* SDK fully up */
+#ifdef CONFIG_HOMEHUB_WIFI_SSID
+    if (CONFIG_HOMEHUB_WIFI_SSID[0] != '\0') {
+        muse_settings_set_wifi(CONFIG_HOMEHUB_WIFI_SSID,
+                               CONFIG_HOMEHUB_WIFI_PASSWORD);
+        ESP_LOGI(TAG, "pushed HOMEHUB WiFi '%s' to Link", CONFIG_HOMEHUB_WIFI_SSID);
+    }
+#endif
+    vTaskDelete(NULL);
+}
+
 static void ondevice_setup(void)
 {
     /* SDK dev override: CONFIG_HOMEHUB_WIFI_SSID connects automatically at
@@ -457,6 +474,7 @@ static void ondevice_setup(void)
     if (CONFIG_HOMEHUB_WIFI_SSID[0] != '\0') {
         ESP_LOGI(TAG, "HOMEHUB_WIFI_SSID override active ('%s'); skipping setup",
                  CONFIG_HOMEHUB_WIFI_SSID);
+        xTaskCreate(link_wifi_push_task, "tdeck_linkwifi", 4096, NULL, 5, NULL);
         return;
     }
 #endif

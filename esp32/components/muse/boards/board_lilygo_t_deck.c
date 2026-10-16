@@ -56,7 +56,6 @@
 #include "muse_mem.h"
 #include "muse_settings.h"
 #include "esp_system.h"  /* esp_restart */
-#include "esp_task_wdt.h"
 
 static const char *TAG = "tdeck";
 
@@ -458,8 +457,11 @@ static void ondevice_setup(void)
     ESP_LOGI(TAG, "on-device setup: type credentials on the keyboard");
     keyboard_set_brightness(120);
 
-    lv_obj_t *scr = lv_obj_create(NULL);
-    lv_screen_load(scr);
+    lv_obj_t *scr = lv_screen_active();  /* SDK builds on this too; clean up after */
+    if (!scr) {
+        ESP_LOGW(TAG, "no screen yet; skipping on-device setup");
+        return;
+    }
 
     lv_obj_t *title = lv_label_create(scr);
     lv_label_set_text(title, "DEVICE SETUP");
@@ -507,7 +509,6 @@ static void ondevice_setup(void)
                                       LV_PART_MAIN);
     }
     while (!done) {
-        esp_task_wdt_reset();  /* this loop waits on the user; keep TWDT happy */
         char k = keyboard_poll();
         if (k >= 0x20 && k <= 0x7E) {
             lv_textarea_add_char(tas[focus], (uint32_t)(unsigned char)k);
@@ -547,7 +548,7 @@ static void ondevice_setup(void)
             changed = true;
         }
     }
-    lv_obj_delete(scr);
+    lv_obj_clean(scr);  /* remove our widgets; leave the screen for the SDK */
     if (changed) {
         vTaskDelay(pdMS_TO_TICKS(300));
         esp_restart();

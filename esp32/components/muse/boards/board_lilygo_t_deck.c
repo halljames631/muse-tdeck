@@ -455,6 +455,7 @@ static void ondevice_setup(void)
     }
 
     ESP_LOGI(TAG, "on-device setup: type credentials on the keyboard");
+    set_brightness(100);  /* SDK only lights the backlight after display_start */
     keyboard_set_brightness(120);
 
     lv_obj_t *scr = lv_screen_active();  /* SDK builds on this too; clean up after */

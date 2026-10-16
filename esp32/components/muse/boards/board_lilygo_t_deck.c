@@ -54,6 +54,8 @@
 
 #include "muse_board.h"
 #include "muse_mem.h"
+#include "muse_settings.h"
+#include "esp_system.h"  /* esp_restart */
 
 static const char *TAG = "tdeck";
 
@@ -276,6 +278,7 @@ static lv_display_t *display_start(lv_indev_t **touch)
     if (!*touch || esp_lv_adapter_start() != ESP_OK) {
         return NULL;
     }
+    ondevice_setup();
     return disp;
 }
 
@@ -386,6 +389,148 @@ static const muse_board_t s_board = {
     .read_power = read_power,
     .power_off = power_off,
 };
+
+
+/* ---- On-device setup via the T-Deck keyboard ----
+ *
+ * The keyboard is a small MCU on I2C (address 0x55, INT on GPIO46) that
+ * reports ASCII keystrokes: a one-byte read returns 0 when idle. This
+ * screen lets the board provision itself -- WiFi SSID, password and the
+ * Hatch token -- typed on the physical keyboard, with no laptop or phone.
+ * It appears when no WiFi is saved yet, or when BOOT is held at boot.
+ * Enter advances fields (saves on the last one), Backspace deletes,
+ * ESC skips. The SAVE button is also tappable. */
+
+#define KB_ADDR 0x55
+#define KB_INT  GPIO_NUM_46
+
+static char keyboard_poll(void)
+{
+    uint8_t b = 0;
+    if (i2c_master_receive(s_i2c, KB_ADDR, &b, 1, 20) != ESP_OK || b == 0) {
+        return 0;
+    }
+    return (char)b;
+}
+
+static void keyboard_set_brightness(uint8_t level)
+{
+    const uint8_t cmd[2] = { 0x01, level };
+    i2c_master_transmit(s_i2c, KB_ADDR, cmd, sizeof(cmd), 50);
+}
+
+static void setup_save_cb(lv_event_t *e)
+{
+    *(bool *)lv_event_get_user_data(e) = true;
+}
+
+static void ondevice_setup(void)
+{
+    char ssid[MUSE_SSID_MAX + 1] = {0};
+    char pass[MUSE_PASS_MAX + 1] = {0};
+    muse_settings_wifi(ssid, pass);
+    if (ssid[0] != '\0' && gpio_get_level(TALK_GPIO) != 0) {
+        return;  /* already provisioned and BOOT not held */
+    }
+
+    ESP_LOGI(TAG, "on-device setup: type credentials on the keyboard");
+    keyboard_set_brightness(120);
+
+    lv_obj_t *scr = lv_obj_create(NULL);
+    lv_screen_load(scr);
+
+    lv_obj_t *title = lv_label_create(scr);
+    lv_label_set_text(title, "DEVICE SETUP");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 6);
+
+    static const char *const labels[3] = {
+        "WiFi name", "WiFi password", "Token (mgst_...)" };
+    static const uint32_t maxlen[3] = {
+        MUSE_SSID_MAX, MUSE_PASS_MAX, MUSE_TOKEN_MAX };
+    lv_obj_t *tas[3];
+    for (int i = 0; i < 3; i++) {
+        lv_obj_t *lb = lv_label_create(scr);
+        lv_label_set_text(lb, labels[i]);
+        lv_obj_set_pos(lb, 12, 30 + i * 50);
+        tas[i] = lv_textarea_create(scr);
+        lv_textarea_set_one_line(tas[i], true);
+        lv_textarea_set_max_length(tas[i], maxlen[i]);
+        if (i == 1) {
+            lv_textarea_set_password_mode(tas[i], true);
+        }
+        if (i == 0 && ssid[0] != '\0') {
+            lv_textarea_set_text(tas[i], ssid);
+        }
+        lv_obj_set_size(tas[i], 296, 30);
+        lv_obj_set_pos(tas[i], 12, 46 + i * 50);
+    }
+
+    lv_obj_t *hint = lv_label_create(scr);
+    lv_label_set_text(hint, "Enter: next   Bksp: del   ESC: skip");
+    lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, 182);
+
+    bool save = false;
+    lv_obj_t *btn = lv_button_create(scr);
+    lv_obj_set_size(btn, 200, 34);
+    lv_obj_align(btn, LV_ALIGN_TOP_MID, 0, 198);
+    lv_obj_t *bl = lv_label_create(btn);
+    lv_label_set_text(bl, "SAVE & REBOOT");
+    lv_obj_center(bl);
+    lv_obj_add_event_cb(btn, setup_save_cb, LV_EVENT_CLICKED, &save);
+
+    int focus = 0;
+    bool done = false;
+    for (int i = 0; i < 3; i++) {
+        lv_obj_set_style_border_width(tas[i], i == focus ? 2 : 0,
+                                      LV_PART_MAIN);
+    }
+    while (!done) {
+        char k = keyboard_poll();
+        if (k >= 0x20 && k <= 0x7E) {
+            lv_textarea_add_char(tas[focus], (uint32_t)(unsigned char)k);
+        } else if (k == 0x08 || k == 0x7F) {
+            lv_textarea_delete_char(tas[focus]);
+        } else if (k == '\r' || k == '\n') {
+            if (++focus >= 3) {
+                save = true;
+            } else {
+                for (int i = 0; i < 3; i++) {
+                    lv_obj_set_style_border_width(tas[i], i == focus ? 2 : 0,
+                                                  LV_PART_MAIN);
+                }
+            }
+        } else if (k == 0x1B) {
+            done = true;  /* ESC: skip */
+        }
+        if (save) {
+            done = true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(30));
+    }
+
+    bool changed = false;
+    if (save) {
+        const char *s = lv_textarea_get_text(tas[0]);
+        const char *pw = lv_textarea_get_text(tas[1]);
+        const char *t = lv_textarea_get_text(tas[2]);
+        if (s[0] != '\0') {
+            muse_settings_set_wifi(s, pw);
+            ESP_LOGI(TAG, "wifi saved for '%s'", s);
+            changed = true;
+        }
+        if (t[0] != '\0' &&
+            muse_settings_set_hatch_token(t, false) == ESP_OK) {
+            ESP_LOGI(TAG, "token saved");
+            changed = true;
+        }
+    }
+    lv_obj_delete(scr);
+    if (changed) {
+        vTaskDelay(pdMS_TO_TICKS(300));
+        esp_restart();
+    }
+    /* Skipped or nothing entered: the SDK shows its own setup screen. */
+}
 
 /* Home Link's app_main starts Muse with this board (main/main.c). */
 const muse_board_t *muse_board_get(void)
